@@ -1,0 +1,8 @@
+{
+  "icon": "rftoolsbuilder:builder",
+  "items": [
+    "rftoolsbuilder:builder",
+    "rftoolsbuilder:shape_card_def"
+  ],
+  "title": "itemGroup.rftoolsbuilder"
+}
