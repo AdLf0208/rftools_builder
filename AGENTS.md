@@ -37,7 +37,25 @@ the port root, never in `target/`. `.horizon/sdk` is fetched per clone (gitignor
 and never packed; `horizon-core` is a second path dependency from the same tree
 only because `horizon-mod-api` does not re-export `JavaString`.
 
-The in-game e2e needs a **launcher-built** game carrying the package:
-`horizon-launcher native-build ports/rftoolsbuilder --instance <i> --trust-native-code`,
-then `GAME=<that horizon-client> tools/e2e.sh`. There is no launcher at this pin
-on this machine, so `tools/e2e.sh` has **not been run** — do not claim it has.
+The in-game e2e needs a **launcher-built** game carrying the package, and the
+Builder's recipe takes `rftoolsbase:machine_frame`, so the game carries **both**
+packages (upstream declares rftoolsbase a required dependency):
+
+```sh
+ports/_shared/evidence/rftoolsbuilder-e2e/bundle-game.sh      # builds + exports it, prints the env
+eval "$(ports/_shared/evidence/rftoolsbuilder-e2e/bundle-game.sh env)"
+ports/tools/build-slot.sh run --job W1-rftoolsbuilder --port ports/rftoolsbuilder --step e2e -- \
+    bash tools/e2e.sh                                         # PASS + EXIT:0
+GAME=$CONTROL_GAME ... tools/e2e.sh                           # the unmodded control: EXIT:1
+SELFTEST=1 ... tools/e2e.sh                                   # the fail-capable leg: EXIT:1
+python3 ports/tools/check-e2e-logs.py rftoolsbuilder-e2e --strict
+```
+
+`bundle-game.sh` copies `ports/rftoolsbase` into a scratch folder and moves the
+copy's `[native] horizon` to this pin — the port itself is read-only and never
+edited. `tools/craft_check.py` (called by `tools/e2e.sh`) crafts both recipes in
+a real table and `tools/check_recipes.py` is the data guard against the 1.21.1
+ingredient dialect.
+
+The 0.2.2 leg ran on 2026-11-21 (`PASS` + `EXIT:0`, control and selftest
+`EXIT:1`); the transcripts are in `ports/_shared/evidence/rftoolsbuilder-e2e/`.

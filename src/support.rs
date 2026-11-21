@@ -12,21 +12,32 @@
 
 use std::sync::OnceLock;
 
-use horizon_core::nbt::JavaString;
 use mod_api::{
     self, BlockEntityEvent, BlockEntityPart, BlockEntityRef, BlockEntityTickEvent,
     BlockEntityTicksEvent, BlockKey, BlockPart, BlockUpdateFlags, Capability, Command,
     CommandArgumentValue, Component, Compound, Flow, Hand, Host, HostBlockStates, HostSide,
-    HostTransaction, ITEMS, InteractionResult, ItemPart, ItemResource, ItemStack, LevelRef,
-    LevelSide, ModContainer, PlayerRef, RegisterCommandsEvent, Registrar, RegistrationContext,
-    ResourceHandler, RightClickBlockEvent, RunModCommandEvent, ServerHost, SoundSource, Tag, Text,
-    UseOnEvent,
+    HostTransaction, ITEMS, Identifier, InteractionResult, ItemPart, ItemResource, ItemStack,
+    LevelRef, LevelSide, ModContainer, PlayerRef, RegisterCommandsEvent, Registrar,
+    RegistrationContext, ResourceHandler, RightClickBlockEvent, RunModCommandEvent, ServerHost,
+    SoundSource, Tag, Text, UseOnEvent,
 };
 
 use crate::runtime::{
     self, BLOCKS_PER_TICK, Card, LOOKUPS_PER_TICK, Progress, Refusal, RefusalReason, Scan, Shape,
     Status,
 };
+
+/// The compound key type, taken from `Tag::String`'s own payload: the API does not re-export the
+/// UTF-16 key type and a path dependency on `horizon-core` is refused by the launcher's build
+/// (it stages only the API crate), so the same conversion a mod's NBT string uses is written here.
+macro_rules! key {
+    ($name:expr) => {{
+        let mod_api::Tag::String(key) = mod_api::Tag::String(($name).into()) else {
+            unreachable!("a string tag always holds a compound key");
+        };
+        key
+    }};
+}
 
 /// The block this slice implements, exactly as the content declares it.
 const BLOCK: &str = runtime::BUILDER;
@@ -80,6 +91,19 @@ const K_REFUSAL_POS: &str = "refusalPos";
 /// The card the current pass belongs to (its shape, size, offset and turn):
 /// a different card starts a new pass.
 const K_CARD: &str = "card";
+/// The pass's cell count, cached when the pass starts so a repeated readout costs nothing.
+const K_CELLS: &str = "cells";
+/// Whether the shape holds more cells than the cached count.
+const K_CELLS_MORE: &str = "cellsMore";
+/// The installed card's item id, in the block entity's saved data. The card lives here (not only in
+/// the container slot): a click-time slot write did not reach the next command's read at this pin,
+/// so the saved data is the one place every path agrees on.
+const K_CARD_ITEM: &str = "cardItem";
+/// The installed card's data (its shape, size, offset, turn and corner selection).
+const K_CARD_DATA: &str = "cardData";
+/// The item id the Builder last mirrored into its container slot: a slot holding anything else was
+/// changed from outside and wins.
+const K_CARD_SHOWN: &str = "cardShown";
 
 /// The card's refusal codes in the saved compound.
 const REFUSAL_NONE: i8 = 0;
@@ -87,6 +111,8 @@ const REFUSAL_NONE: i8 = 0;
 const REFUSAL_NO_MATERIAL: i8 = 1;
 /// `RefusalReason::OutOfWorld`.
 const REFUSAL_OUT_OF_WORLD: i8 = 2;
+/// `RefusalReason::Protected`.
+const REFUSAL_PROTECTED: i8 = 3;
 
 /// The block key the hooks compare the loaded block against. A `BlockKey` only
 /// names itself through a host, so it is asked for once, at registration.
@@ -242,7 +268,7 @@ fn card_of(data: &Compound) -> Card {
             .and_then(|name| Shape::parse(&name))
             .unwrap_or(default.shape),
         solid: data
-            .get(&JavaString::from(K_SOLID))
+            .get(&key!(K_SOLID))
             .and_then(|tag| match tag {
                 Tag::Byte(flag) => Some(*flag != 0),
                 _ => None,
@@ -255,7 +281,7 @@ fn card_of(data: &Compound) -> Card {
                 .and_then(|code| runtime::Rotation::parse(&code))
                 .unwrap_or(default.modifier.rotation),
             flip_y: data
-                .get(&JavaString::from(K_FLIP_Y))
+                .get(&key!(K_FLIP_Y))
                 .and_then(|tag| match tag {
                     Tag::Byte(flag) => Some(*flag != 0),
                     _ => None,
@@ -267,21 +293,56 @@ fn card_of(data: &Compound) -> Card {
 
 /// Writes a card into a data compound.
 fn put_card(data: &mut Compound, card: Card) {
-    data.insert(
-        JavaString::from(K_SHAPE),
-        Tag::String(card.shape.id().into()),
-    );
-    data.insert(JavaString::from(K_SOLID), Tag::Byte(i8::from(card.solid)));
+    data.insert(key!(K_SHAPE), Tag::String(card.shape.id().into()));
+    data.insert(key!(K_SOLID), Tag::Byte(i8::from(card.solid)));
     put_ints(data, K_DIMENSION, card.dimension);
     put_ints(data, K_OFFSET, card.offset);
     data.insert(
-        JavaString::from(K_ROTATION),
+        key!(K_ROTATION),
         Tag::String(card.modifier.rotation.id().into()),
     );
-    data.insert(
-        JavaString::from(K_FLIP_Y),
-        Tag::Byte(i8::from(card.modifier.flip_y)),
-    );
+    data.insert(key!(K_FLIP_Y), Tag::Byte(i8::from(card.modifier.flip_y)));
+}
+
+/// The card in the Builder's slot, as its saved compound holds it: the item id and the card's own
+/// data, which is everything the stack's component carried.
+fn saved_card(data: &Compound) -> Option<(String, CardData)> {
+    let item = string(data, K_CARD_ITEM)?;
+    let Some(Tag::Compound(card)) = data.get(&key!(K_CARD_DATA)) else {
+        return None;
+    };
+    Some((
+        item,
+        CardData {
+            card: card_of(card),
+            selection: selection_of(card),
+        },
+    ))
+}
+
+/// Write the card slot into the saved compound, or empty it with `None`.
+fn write_saved_card(data: &mut Compound, card: Option<(&str, &CardData)>) {
+    match card {
+        Some((item, payload)) => {
+            data.insert(key!(K_CARD_ITEM), Tag::String(item.into()));
+            let mut fields = Compound::new();
+            put_card(&mut fields, payload.card);
+            put_selection(&mut fields, &payload.selection);
+            data.insert(key!(K_CARD_DATA), Tag::Compound(fields));
+        }
+        None => {
+            data.remove(&key!(K_CARD_ITEM));
+            data.remove(&key!(K_CARD_DATA));
+        }
+    }
+}
+
+/// The stack a saved card makes: the item with the card's data set as its component. `None` when
+/// the id is not an item of this world or the stack refuses the component.
+fn card_stack(host: &dyn Host, card: &(String, CardData)) -> Option<ItemStack> {
+    let key = host.item_key(&Identifier::parse_namespaced(&card.0)?)?;
+    let mut stack = ItemStack::of(key);
+    card.1.write(&mut stack).then_some(stack)
 }
 
 /// The selection a data compound holds.
@@ -292,7 +353,7 @@ fn selection_of(data: &Compound) -> Selection {
     };
     Selection {
         mode: data
-            .get(&JavaString::from(K_MODE))
+            .get(&key!(K_MODE))
             .and_then(|tag| match tag {
                 Tag::Byte(mode) => u8::try_from(*mode).ok(),
                 _ => None,
@@ -308,33 +369,33 @@ fn selection_of(data: &Compound) -> Selection {
 /// (`replace_data`'s job for a block entity; a component compound is ours).
 fn put_selection(data: &mut Compound, selection: &Selection) {
     data.insert(
-        JavaString::from(K_MODE),
+        key!(K_MODE),
         Tag::Byte(i8::try_from(selection.mode).unwrap_or(0)),
     );
     match &selection.target {
         Some((dimension, pos)) => {
             data.insert(
-                JavaString::from(K_SELECTED_DIMENSION),
+                key!(K_SELECTED_DIMENSION),
                 Tag::String(dimension.as_str().into()),
             );
             put_ints(data, K_SELECTED, *pos);
         }
         None => {
-            data.remove(&JavaString::from(K_SELECTED_DIMENSION));
-            data.remove(&JavaString::from(K_SELECTED));
+            data.remove(&key!(K_SELECTED_DIMENSION));
+            data.remove(&key!(K_SELECTED));
         }
     }
     match selection.corner1 {
         Some(pos) => put_ints(data, K_CORNER1, pos),
         None => {
-            data.remove(&JavaString::from(K_CORNER1));
+            data.remove(&key!(K_CORNER1));
         }
     }
 }
 
 /// A compound's string field.
 fn string(data: &Compound, key: &str) -> Option<String> {
-    match data.get(&JavaString::from(key)) {
+    match data.get(&key!(key)) {
         Some(Tag::String(text)) => Some(text.to_string_lossy()),
         _ => None,
     }
@@ -347,7 +408,7 @@ fn ints(data: &Compound, key: &str) -> Option<[i32; 3]> {
         Tag::Int(value) => Some(*value),
         _ => None,
     };
-    match data.get(&JavaString::from(key)) {
+    match data.get(&key!(key)) {
         Some(Tag::List(values)) if values.len() == 3 => {
             Some([read(&values[0])?, read(&values[1])?, read(&values[2])?])
         }
@@ -359,7 +420,7 @@ fn ints(data: &Compound, key: &str) -> Option<[i32; 3]> {
 /// Writes a three-integer field.
 fn put_ints(data: &mut Compound, key: &str, value: [i32; 3]) {
     data.insert(
-        JavaString::from(key),
+        key!(key),
         Tag::List(vec![
             Tag::Int(value[0]),
             Tag::Int(value[1]),
@@ -385,23 +446,26 @@ struct State {
     done: bool,
     /// Where and why it stopped.
     refusal: Option<Refusal>,
+    /// The pass's cell count, cached when the pass started.
+    cells: Option<runtime::CellCount>,
 }
 
 impl State {
     /// The state a saved compound holds.
     fn read(nbt: &Compound) -> Self {
-        let number = |key: &str| match nbt.get(&JavaString::from(key)) {
+        let number = |key: &str| match nbt.get(&key!(key)) {
             Some(Tag::Long(value)) => u64::try_from(*value).ok(),
             Some(Tag::Int(value)) => u64::try_from(*value).ok(),
             _ => None,
         };
-        let refusal = match nbt.get(&JavaString::from(K_REFUSAL)) {
+        let refusal = match nbt.get(&key!(K_REFUSAL)) {
             Some(Tag::Byte(code)) if *code == REFUSAL_NO_MATERIAL => {
                 Some(RefusalReason::NoMaterial)
             }
             Some(Tag::Byte(code)) if *code == REFUSAL_OUT_OF_WORLD => {
                 Some(RefusalReason::OutOfWorld)
             }
+            Some(Tag::Byte(code)) if *code == REFUSAL_PROTECTED => Some(RefusalReason::Protected),
             _ => None,
         }
         .map(|reason| Refusal {
@@ -415,8 +479,12 @@ impl State {
                 placed: number(K_PLACED).unwrap_or(0),
                 skipped: number(K_SKIPPED).unwrap_or(0),
             },
-            done: matches!(nbt.get(&JavaString::from(K_DONE)), Some(Tag::Byte(1))),
+            done: matches!(nbt.get(&key!(K_DONE)), Some(Tag::Byte(1))),
             refusal,
+            cells: number(K_CELLS).map(|cells| runtime::CellCount {
+                cells,
+                more: matches!(nbt.get(&key!(K_CELLS_MORE)), Some(Tag::Byte(1))),
+            }),
         }
     }
 
@@ -426,39 +494,53 @@ impl State {
     fn write(&self, nbt: &mut Compound) {
         match &self.card {
             Some(card) => {
-                nbt.insert(JavaString::from(K_CARD), Tag::String(card.as_str().into()));
+                nbt.insert(key!(K_CARD), Tag::String(card.as_str().into()));
             }
             None => {
-                nbt.remove(&JavaString::from(K_CARD));
+                nbt.remove(&key!(K_CARD));
             }
         }
         match self.cursor {
             Some(cursor) => put_ints(nbt, K_CURSOR, cursor),
             None => {
-                nbt.remove(&JavaString::from(K_CURSOR));
+                nbt.remove(&key!(K_CURSOR));
             }
         }
         nbt.insert(
-            JavaString::from(K_PLACED),
+            key!(K_PLACED),
             Tag::Long(i64::try_from(self.progress.placed).unwrap_or(i64::MAX)),
         );
         nbt.insert(
-            JavaString::from(K_SKIPPED),
+            key!(K_SKIPPED),
             Tag::Long(i64::try_from(self.progress.skipped).unwrap_or(i64::MAX)),
         );
-        nbt.insert(JavaString::from(K_DONE), Tag::Byte(i8::from(self.done)));
+        nbt.insert(key!(K_DONE), Tag::Byte(i8::from(self.done)));
+        match self.cells {
+            Some(cells) => {
+                nbt.insert(
+                    key!(K_CELLS),
+                    Tag::Long(i64::try_from(cells.cells).unwrap_or(i64::MAX)),
+                );
+                nbt.insert(key!(K_CELLS_MORE), Tag::Byte(i8::from(cells.more)));
+            }
+            None => {
+                nbt.remove(&key!(K_CELLS));
+                nbt.remove(&key!(K_CELLS_MORE));
+            }
+        }
         match self.refusal {
             Some(refusal) => {
                 let code = match refusal.reason {
                     RefusalReason::NoMaterial => REFUSAL_NO_MATERIAL,
                     RefusalReason::OutOfWorld => REFUSAL_OUT_OF_WORLD,
+                    RefusalReason::Protected => REFUSAL_PROTECTED,
                 };
-                nbt.insert(JavaString::from(K_REFUSAL), Tag::Byte(code));
+                nbt.insert(key!(K_REFUSAL), Tag::Byte(code));
                 put_ints(nbt, K_REFUSAL_POS, refusal.at);
             }
             None => {
-                nbt.insert(JavaString::from(K_REFUSAL), Tag::Byte(REFUSAL_NONE));
-                nbt.remove(&JavaString::from(K_REFUSAL_POS));
+                nbt.insert(key!(K_REFUSAL), Tag::Byte(REFUSAL_NONE));
+                nbt.remove(&key!(K_REFUSAL_POS));
             }
         }
     }
@@ -467,6 +549,68 @@ impl State {
 // ---------------------------------------------------------------------------
 // The tick
 // ---------------------------------------------------------------------------
+
+/// Bring the Builder's card slot into agreement: fold a container change back into the saved data,
+/// then mirror the saved card into the container slot if it holds something else.
+///
+/// The card is kept in the saved compound because that is the one place a click and a command
+/// agree on at this pin: a `set_item_slot` made by the click is visible to the click's own read and
+/// invisible to the next `/rftoolsbuilder status`, which reported "no shape card" for an installed
+/// card (measured 2026-11-19). `event.entity.items` is the game's container view, so it is refreshed
+/// here for the menu, a hopper or `ctl container`.
+fn sync_card(
+    host: &mut dyn ServerHost,
+    event: &mut BlockEntityTickEvent<'_>,
+) -> Option<(String, CardData)> {
+    let shown = string(&event.entity.nbt, K_CARD_SHOWN);
+    let held = event
+        .entity
+        .items
+        .first()
+        .and_then(Option::as_ref)
+        .map(|stack| (stack.item().id(&*host), CardData::read(stack)));
+    let mut saved = saved_card(&event.entity.nbt);
+    let mut changed = false;
+    // An outside change: the container holds a card other than the one mirrored last tick.
+    if held.as_ref().map(|(item, _)| item) != shown.as_ref() {
+        saved = held.clone();
+        changed = true;
+    }
+    let want = saved.as_ref().and_then(|card| card_stack(&*host, card));
+    let current = event.entity.items.first().and_then(Option::as_ref).cloned();
+    let same = match (&current, &want) {
+        (None, None) => true,
+        (Some(have), Some(want)) => have == want,
+        _ => false,
+    };
+    if !same {
+        match want.clone() {
+            Some(stack) => event.entity.items = vec![Some(stack)],
+            None => event.entity.items = vec![None],
+        }
+        event.entity.items.resize(SLOT_CARD + 1, None);
+        changed = true;
+    }
+    let shown_now = saved.as_ref().map(|(item, _)| item.clone());
+    if string(&event.entity.nbt, K_CARD_SHOWN) != shown_now {
+        match shown_now {
+            Some(item) => {
+                event
+                    .entity
+                    .nbt
+                    .insert(key!(K_CARD_SHOWN), Tag::String(item.as_str().into()));
+            }
+            None => {
+                event.entity.nbt.remove(&key!(K_CARD_SHOWN));
+            }
+        }
+        changed = true;
+    }
+    if changed {
+        *event.reply = mod_api::BlockEntityTickReply::Changed;
+    }
+    saved
+}
 
 /// One server tick of a Builder: walk the shape and place a block into each
 /// cell that can take one, at the jar's [`BLOCKS_PER_TICK`].
@@ -477,13 +621,11 @@ impl State {
 /// the port does one pass and says so — notes.md).
 fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
     let pos = event.pos;
-    let card = event
-        .entity
-        .items
-        .first()
-        .and_then(Option::as_ref)
-        .map(CardData::read)
-        .map(|data| data.card);
+    // The card slot lives in the saved data and is mirrored into the container every tick; a
+    // container slot holding something other than what the Builder last mirrored was changed from
+    // outside (a click that has not been read back yet) and wins.
+    let mirrored = sync_card(host, event);
+    let card = mirrored.as_ref().map(|(_, payload)| payload.card);
     let before = State::read(&event.entity.nbt);
     let mut state = before.clone();
 
@@ -519,8 +661,12 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
     // and a finished pass stays finished until the card changes.
     let fingerprint = fingerprint(card);
     if state.card.as_deref() != Some(fingerprint.as_str()) {
+        // One bounded count per pass, kept in the block entity: a repeated readout is free, and
+        // even the first one never walks a shape whose box holds tens of millions of cells.
+        let (cells, more) = card.count_within(runtime::MAX_PASS_CELLS, runtime::STATUS_CANDIDATES);
         state = State {
             card: Some(fingerprint),
+            cells: Some(runtime::CellCount { cells, more }),
             ..State::default()
         };
         state.write(&mut event.entity.nbt);
@@ -551,7 +697,11 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
             break;
         };
         steps += 1;
-        if card.contains(pos, cursor) {
+        if cell_protected(host, level, cursor) {
+            // The cell belongs to a player who may not be built in (outside the border): it is
+            // skipped and no material is taken for it.
+            state.progress.skipped += 1;
+        } else if card.contains(pos, cursor) {
             if !level.is_loaded(host, cursor) {
                 // Nothing can be read or written there; look again next tick.
                 state.refusal = Some(Refusal {
@@ -784,34 +934,42 @@ fn install(host: &mut dyn ServerHost, pos: [i32; 3], uuid: u128, stack: Option<I
     let Some(entity) = entity_at(host, pos) else {
         return;
     };
-    let occupied = entity
-        .item_slot(host, u32::try_from(SLOT_CARD).unwrap_or(0))
-        .ok()
-        .flatten()
-        .is_some();
-    if occupied {
-        action_bar(
-            host,
-            uuid,
-            "Builder: a card is already in (sneak-right-click with an empty hand to take it)",
-        );
+    let mut data = entity.data(&*host).unwrap_or_default();
+    // The slot holds one card, as upstream's does; clicking with another swaps them and the old
+    // one goes back to the player rather than vanishing.
+    if let Some(old) = saved_card(&data) {
+        let Some(old_stack) = card_stack(&*host, &old) else {
+            return;
+        };
+        let returned = host
+            .player(uuid)
+            .is_some_and(|player| player.give_stack(host, old_stack).is_ok());
+        if !returned {
+            action_bar(
+                host,
+                uuid,
+                "Builder: the card in it could not be given back",
+            );
+            return;
+        }
+    }
+    let Some(item) = stack.item().id(&*host).into() else {
+        return;
+    };
+    let payload = CardData::read(&stack);
+    write_saved_card(&mut data, Some((&item, &payload)));
+    // Outside a transaction: a `replace_data` inside one is rolled back with it at this pin
+    // (measured on `integratedcrafting`, 2026-11-19), which is why the card is written here and the
+    // hand is charged after it.
+    if entity.replace_data(host, data).is_err() {
+        action_bar(host, uuid, "Builder: the card could not be put in");
         return;
     }
-    let put = host
-        .transaction(|host, tx| {
-            entity.set_item_slot(
-                host,
-                tx,
-                u32::try_from(SLOT_CARD).unwrap_or(0),
-                Some(stack.clone()),
-            )
-        })
-        .is_ok();
-    if put {
-        take_from_hand(host, uuid, &stack, 1);
-        let line = status_at(host, pos);
-        action_bar(host, uuid, &line);
-    }
+    let _ = entity.set_changed(host);
+    take_from_hand(host, uuid, &stack, 1);
+    // The container slot follows on the next tick (`sync_card`); the action bar is right now.
+    let line = status_at(host, pos);
+    action_bar(host, uuid, &line);
 }
 
 /// Takes the card out of the Builder into the player's inventory.
@@ -819,31 +977,35 @@ fn take_card(host: &mut dyn ServerHost, pos: [i32; 3], uuid: u128) {
     let Some(entity) = entity_at(host, pos) else {
         return;
     };
-    let slot = u32::try_from(SLOT_CARD).unwrap_or(0);
-    let Some(card) = entity.item_slot(host, slot).ok().flatten() else {
+    let mut data = entity.data(&*host).unwrap_or_default();
+    let Some(card) = saved_card(&data) else {
         action_bar(host, uuid, "Builder: no card to take");
         return;
     };
-    let emptied = host
-        .transaction(|host, tx| entity.set_item_slot(host, tx, slot, None))
-        .is_ok();
-    if !emptied {
+    let Some(stack) = card_stack(&*host, &card) else {
+        action_bar(host, uuid, "Builder: the card could not be read");
+        return;
+    };
+    write_saved_card(&mut data, None);
+    if entity.replace_data(host, data.clone()).is_err() {
         return;
     }
     let given = match host.player(uuid) {
-        Some(player) => player.give_stack(host, card.clone()).is_ok(),
+        Some(player) => player.give_stack(host, stack).is_ok(),
         None => false,
     };
     if !given {
         // The card stays in the Builder rather than vanishing.
-        let _ = host.transaction(|host, tx| entity.set_item_slot(host, tx, slot, Some(card)));
+        write_saved_card(&mut data, Some((&card.0, &card.1)));
+        let _ = entity.replace_data(host, data);
         action_bar(host, uuid, "Builder: the card could not be given back");
         return;
     }
+    let _ = entity.set_changed(host);
     // The card is out: the pass it was driving goes with it.
-    let mut data = Compound::new();
-    State::default().write(&mut data);
-    let _ = entity.merge_data(host, data);
+    let mut cleared = Compound::new();
+    State::default().write(&mut cleared);
+    let _ = entity.merge_data(host, cleared);
     action_bar(host, uuid, "Builder: card taken");
 }
 
@@ -1089,8 +1251,9 @@ pub(crate) fn on_run_mod_command(
             };
             let pos = *pos;
             if !is_builder(host, pos) {
-                let block = block_at(host, pos);
-                feedback(host, &format!("{block}: not a builder"));
+                // A generic refusal: naming the block there would turn a Builder readout into a
+                // probe for whatever a player points it at (review 1276-rftoolsbuilder).
+                feedback(host, "not a builder");
                 return Flow::Cancel;
             }
             let line = status_at(host, pos);
@@ -1202,11 +1365,19 @@ fn feedback(host: &mut dyn ServerHost, line: &str) {
     let _ = host.commands().feedback(Text::literal(line));
 }
 
-/// The id of the block at `pos`, for a command's answer.
-fn block_at(host: &dyn Host, pos: [i32; 3]) -> String {
-    host.level(host.dimension())
-        .and_then(|level| level.block(host, pos))
-        .map_or_else(String::new, |block| block.id(host))
+/// Whether `pos` is protected from this Builder: outside the world border, or outside the
+/// world's bounds. The pin has no `ServerLevel.mayInteract` helper, so the check is the part of it
+/// the API can answer; the difference is recorded in `notes.md`.
+fn cell_protected(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> bool {
+    if level.in_world_bounds(&*host, pos) == Some(false) {
+        return true;
+    }
+    let Some([min_x, min_z, max_x, max_z]) = level.world_border(&*host) else {
+        return false;
+    };
+    let x = f64::from(pos[0]) + 0.5;
+    let z = f64::from(pos[2]) + 0.5;
+    !(min_x..=max_x).contains(&x) || !(min_z..=max_z).contains(&z)
 }
 
 /// Reads a Builder out as `/rftoolsbuilder status` and the action bar say it.
@@ -1217,11 +1388,10 @@ fn status_at(host: &dyn Host, pos: [i32; 3]) -> String {
             pos[0], pos[1], pos[2]
         );
     };
-    let card = entity
-        .item_slot(host, u32::try_from(SLOT_CARD).unwrap_or(0))
-        .ok()
-        .flatten()
-        .map(|stack| CardData::read(&stack).card);
+    let state = State::read(&entity.data(host).unwrap_or_default());
+    // The card comes from the saved data, which every path agrees on; the container slot is this
+    // tick's mirror of it (`sync_card`).
+    let card = saved_card(&entity.data(host).unwrap_or_default()).map(|(_, payload)| payload.card);
     let (card, refused_card) = match card {
         Some(card) => match card.validate() {
             Ok(valid) => (Some(valid), None),
@@ -1229,7 +1399,6 @@ fn status_at(host: &dyn Host, pos: [i32; 3]) -> String {
         },
         None => (None, None),
     };
-    let state = State::read(&entity.data(host).unwrap_or_default());
     runtime::status_line(&Status {
         at: pos,
         card,
@@ -1237,6 +1406,7 @@ fn status_at(host: &dyn Host, pos: [i32; 3]) -> String {
         progress: state.progress,
         refusal: state.refusal,
         complete: state.done,
+        cells: state.cells,
     })
 }
 
@@ -1268,11 +1438,8 @@ mod tests {
     fn a_missing_or_broken_component_is_the_jars_default_card() {
         assert_eq!(card_of(&Compound::new()), Card::default());
         let mut broken = Compound::new();
-        broken.insert(
-            JavaString::from(K_SHAPE),
-            Tag::String("SHAPE_COMPOSITION".into()),
-        );
-        broken.insert(JavaString::from(K_DIMENSION), Tag::String("nope".into()));
+        broken.insert(key!(K_SHAPE), Tag::String("SHAPE_COMPOSITION".into()));
+        broken.insert(key!(K_DIMENSION), Tag::String("nope".into()));
         let card = card_of(&broken);
         assert_eq!(card.shape, Shape::Box, "an uncarried shape falls back");
         assert_eq!(card.dimension, [5, 5, 5], "a broken box falls back");
@@ -1290,8 +1457,8 @@ mod tests {
         put_selection(&mut data, &selection);
         assert_eq!(selection_of(&data), selection);
         put_selection(&mut data, &Selection::default());
-        assert!(!data.contains_key(&JavaString::from(K_SELECTED)));
-        assert!(!data.contains_key(&JavaString::from(K_CORNER1)));
+        assert!(!data.contains_key(&key!(K_SELECTED)));
+        assert!(!data.contains_key(&key!(K_CORNER1)));
         assert_eq!(selection_of(&data), Selection::default());
     }
 
@@ -1336,6 +1503,41 @@ mod tests {
     }
 
     #[test]
+    fn the_installed_card_round_trips_through_the_saved_data() {
+        // The card lives in the block entity's saved compound (the container slot did not carry a
+        // click-time write through to the next command at this pin), so the saved form must hold
+        // everything the stack's component held: the item and the card's data.
+        let payload = CardData {
+            card: Card {
+                shape: Shape::Sphere,
+                solid: false,
+                dimension: [7, 3, 5],
+                offset: [2, -1, 3],
+                modifier: runtime::Modifier {
+                    rotation: runtime::Rotation::Y,
+                    flip_y: true,
+                },
+            },
+            selection: Selection {
+                mode: 2,
+                target: Some(("minecraft:overworld".to_owned(), [10, 64, 10])),
+                corner1: Some([1, 2, 3]),
+            },
+        };
+        let mut data = Compound::new();
+        write_saved_card(&mut data, Some(("rftoolsbuilder:shape_card_def", &payload)));
+        let (item, read) = saved_card(&data).expect("the saved card comes back");
+        assert_eq!(item, "rftoolsbuilder:shape_card_def");
+        assert_eq!(
+            read, payload,
+            "shape, size, offset, turn and selection survive"
+        );
+        // An emptied slot leaves nothing behind.
+        write_saved_card(&mut data, None);
+        assert!(saved_card(&data).is_none());
+    }
+
+    #[test]
     fn a_builders_state_round_trips_through_its_compound() {
         let state = State {
             card: Some("SHAPE_BOX-true-5x5x5-0,0,0-0".to_owned()),
@@ -1345,6 +1547,10 @@ mod tests {
                 skipped: 40,
             },
             done: false,
+            cells: Some(runtime::CellCount {
+                cells: 125,
+                more: false,
+            }),
             refusal: Some(Refusal {
                 at: [4, 66, -2],
                 reason: RefusalReason::NoMaterial,
@@ -1362,12 +1568,9 @@ mod tests {
         };
         done.write(&mut nbt);
         assert_eq!(State::read(&nbt), done);
-        assert!(!nbt.contains_key(&JavaString::from(K_CURSOR)));
-        assert!(!nbt.contains_key(&JavaString::from(K_REFUSAL_POS)));
-        assert_eq!(
-            nbt.get(&JavaString::from(K_REFUSAL)),
-            Some(&Tag::Byte(REFUSAL_NONE))
-        );
+        assert!(!nbt.contains_key(&key!(K_CURSOR)));
+        assert!(!nbt.contains_key(&key!(K_REFUSAL_POS)));
+        assert_eq!(nbt.get(&key!(K_REFUSAL)), Some(&Tag::Byte(REFUSAL_NONE)));
     }
 
     #[test]

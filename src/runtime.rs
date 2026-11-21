@@ -36,6 +36,13 @@ pub const MAX_PASS_CELLS: u64 = 2_097_152;
 /// `BuilderConfiguration.quarryBaseSpeed`: blocks the Builder handles in one
 /// tick at infusion 0 (the shaped path's `checkStateServerShaped`).
 pub const BLOCKS_PER_TICK: u32 = 8;
+/// The most shape cells one `/rftoolsbuilder status` readout may inspect. The card limit allows
+/// 50,000,000, and a sparse shape (a shell, a torus) has to look at each of them to count its own:
+/// enumerating that on the server thread stall the tick (review 1276-rftoolsbuilder). A status
+/// answer therefore stops after this many candidates and says the count is at least what it found.
+/// A box answers from its dimensions and never enumerates.
+pub const STATUS_CANDIDATES: u64 = 250_000;
+
 /// `100 * quarryBaseSpeed`: the most cells one tick looks at. Upstream's
 /// `handleBlockShaped` looks at up to 100 cells per call and is called
 /// `quarryBaseSpeed` times a tick, so a scan never touches more than this.
@@ -131,6 +138,8 @@ pub enum RefusalReason {
     NoMaterial,
     /// The shape lies outside the world's build height.
     OutOfWorld,
+    /// The cell is protected: outside the world border, or spawn-protected.
+    Protected,
 }
 
 /// The cell the Builder is waiting at, and why.
@@ -182,6 +191,20 @@ pub struct Status {
     pub refusal: Option<Refusal>,
     /// Whether the pass has finished.
     pub complete: bool,
+    /// The cells the readout prints: the pass's cached count when the block entity holds one, so a
+    /// repeated `/rftoolsbuilder status` costs nothing. `None` computes it within
+    /// [`STATUS_CANDIDATES`] candidates.
+    pub cells: Option<CellCount>,
+}
+
+/// A shape's cell count as a readout prints it: the number found, and whether the shape holds
+/// more (past [`MAX_PASS_CELLS`] kept cells, or past the candidates the readout may inspect).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CellCount {
+    /// The cells counted, at least.
+    pub cells: u64,
+    /// Whether the shape holds more than `cells`.
+    pub more: bool,
 }
 
 impl Default for Card {
@@ -458,13 +481,26 @@ impl Card {
     /// cells have been kept. `truncated` says the shape holds more.
     #[must_use]
     pub fn cells(self, origin: [i32; 3], cap: u64) -> (Vec<[i32; 3]>, bool) {
+        self.cells_within(origin, cap, u64::MAX)
+    }
+
+    /// [`Card::cells`] with a bound on how many candidates it may test, so a readout that only
+    /// needs a count never walks a shape whose box holds tens of millions of cells.
+    #[must_use]
+    pub fn cells_within(self, origin: [i32; 3], cap: u64, work: u64) -> (Vec<[i32; 3]>, bool) {
         let min = self.min_corner(origin);
         let dim = self.modifier.rotation.transform_dimension(self.dimension);
         let mut out = Vec::new();
         let mut truncated = false;
+        let mut looked = 0u64;
         'outer: for ox in 0..dim[0] {
             for oz in 0..dim[2] {
                 for oy in 0..dim[1] {
+                    if looked >= work {
+                        truncated = true;
+                        break 'outer;
+                    }
+                    looked += 1;
                     let pos = [min[0] + ox, min[1] + oy, min[2] + oz];
                     if !(self.contains(origin, pos)) {
                         continue;
@@ -485,6 +521,15 @@ impl Card {
     /// holds more than `cap`.
     #[must_use]
     pub fn count(self, cap: u64) -> (u64, bool) {
+        self.count_within(cap, u64::MAX)
+    }
+
+    /// [`Card::count`] with a bound on the candidates it may inspect, so a readout can answer in
+    /// bounded time: it stops once `work` cells have been looked at and reports that there are
+    /// more, exactly as it does past `cap` kept cells. A box is answered from its dimensions and
+    /// inspects nothing.
+    #[must_use]
+    pub fn count_within(self, cap: u64, work: u64) -> (u64, bool) {
         if self.modifier == Modifier::default() && self.shape == Shape::Box {
             let volume = self.box_cells();
             if self.solid {
@@ -500,7 +545,7 @@ impl Card {
             let shell = volume - interior;
             return (shell.min(cap), shell > cap);
         }
-        let (cells, truncated) = self.cells([0, 0, 0], cap);
+        let (cells, truncated) = self.cells_within([0, 0, 0], cap, work);
         (cells.len() as u64, truncated)
     }
 }
@@ -825,6 +870,7 @@ impl RefusalReason {
         match self {
             RefusalReason::NoMaterial => "no block to place (put one above or below the builder)",
             RefusalReason::OutOfWorld => "outside the world's build height",
+            RefusalReason::Protected => "protected (outside the world border)",
         }
     }
 }
@@ -874,9 +920,13 @@ pub fn status_line(status: &Status) -> String {
     };
     let [dx, dy, dz] = card.dimension;
     let [ox, oy, oz] = card.offset;
-    let (cells, truncated) = card.count(MAX_PASS_CELLS);
+    let count = status.cells.unwrap_or_else(|| {
+        let (cells, more) = card.count_within(MAX_PASS_CELLS, STATUS_CANDIDATES);
+        CellCount { cells, more }
+    });
+    let (cells, truncated) = (count.cells, count.more);
     let cap = if truncated {
-        format!(" (first {MAX_PASS_CELLS} cells)")
+        format!(" (first {cells} cells)")
     } else {
         String::new()
     };
@@ -927,6 +977,83 @@ mod tests {
     }
 
     // --- the shapes' exact cell counts ------------------------------------
+
+    /// The tick's walk, exactly as `support::tick` drives it: at most `BLOCKS_PER_TICK` placements
+    /// and `LOOKUPS_PER_TICK` cells a tick, one tick at a time, with a fake world that holds the
+    /// scenario's own blocks (the Builder, the chest above it, the pedestal) and everything an
+    /// earlier pass built. Returns (cells visited in shape, placed, ticks).
+    fn walk_pass(
+        origin: [i32; 3],
+        card: Card,
+        occupied: &mut std::collections::BTreeSet<[i32; 3]>,
+        ticks: u32,
+    ) -> (u64, u64, u32) {
+        let mut scan = Scan::start(origin, card);
+        let mut visited = 0u64;
+        let mut placed = 0u64;
+        let mut used = 0u32;
+        for _ in 0..ticks {
+            used += 1;
+            let mut this_tick = 0u32;
+            let mut steps = 0u32;
+            while this_tick < BLOCKS_PER_TICK && steps < LOOKUPS_PER_TICK {
+                let Some(cursor) = scan.cursor else { break };
+                steps += 1;
+                if card.contains(origin, cursor) {
+                    visited += 1;
+                    if !occupied.contains(&cursor) {
+                        occupied.insert(cursor);
+                        placed += 1;
+                        this_tick += 1;
+                    }
+                }
+                if !scan.advance() {
+                    return (visited, placed, used);
+                }
+            }
+        }
+        (visited, placed, used)
+    }
+
+    #[test]
+    fn a_second_pass_over_a_hollow_box_visits_and_builds_every_cell() {
+        // The harness's sequence: a solid 3x3x3 pass on a Builder that has a chest above it and a
+        // pedestal under the box's corner, then a hollow 5x5x5 pass on the same Builder. Every cell
+        // of the shell must be visited once and built: a walk that under-visits shows up here as
+        // fewer placed cells than the shape holds.
+        let at = [0, 0, 0];
+        let mut occupied: std::collections::BTreeSet<[i32; 3]> = std::collections::BTreeSet::new();
+        occupied.insert(at); // the Builder itself
+        occupied.insert([0, 1, 0]); // the chest above it
+        occupied.insert([0, 0, -1]); // the pedestal under the box's corner
+
+        let solid = Card {
+            shape: Shape::Box,
+            solid: true,
+            dimension: [3, 3, 3],
+            ..Card::default()
+        };
+        let (visited, placed, _) = walk_pass(at, solid, &mut occupied, 200);
+        assert_eq!(visited, 27, "every cell of a solid 3x3x3 box");
+        assert_eq!(
+            placed, 24,
+            "the Builder, the chest above it and the pedestal cannot take a block"
+        );
+
+        let hollow = Card {
+            shape: Shape::Box,
+            solid: false,
+            dimension: [5, 5, 5],
+            ..Card::default()
+        };
+        let (visited, placed, ticks) = walk_pass(at, hollow, &mut occupied, 400);
+        assert_eq!(visited, 98, "every shell cell is looked at exactly once");
+        assert_eq!(
+            placed, 98,
+            "and every shell cell is built (none of them is the chest, the Builder or the pedestal)"
+        );
+        assert!(ticks < 400, "the pass finishes inside its ticks");
+    }
 
     #[test]
     fn a_box_holds_exactly_its_dimensions() {
@@ -1310,6 +1437,7 @@ mod tests {
                 progress: Progress::default(),
                 refusal: None,
                 complete: false,
+                cells: None,
             }),
             "Builder at 10 64 10: no shape card"
         );
@@ -1325,6 +1453,7 @@ mod tests {
                 progress: Progress::default(),
                 refusal: None,
                 complete: false,
+                cells: None,
             }),
             "Builder at 10 64 10: Sphere (Solid) 5x5x5 offset 0 0 0, 81 cells, not started"
         );
@@ -1339,6 +1468,7 @@ mod tests {
                 },
                 refusal: None,
                 complete: false,
+                cells: None,
             }),
             "Builder at 10 64 10: Sphere (Solid) 5x5x5 offset 0 0 0, 81 cells, 12 placed, 40 skipped"
         );
@@ -1353,6 +1483,7 @@ mod tests {
                 },
                 refusal: None,
                 complete: true,
+                cells: None,
             }),
             "Builder at 10 64 10: Sphere (Solid) 5x5x5 offset 0 0 0, 81 cells, 81 placed, scan complete"
         );
@@ -1370,6 +1501,7 @@ mod tests {
                     reason: RefusalReason::NoMaterial,
                 }),
                 complete: false,
+                cells: None,
             }),
             "Builder at 10 64 10: Sphere (Solid) 5x5x5 offset 0 0 0, 81 cells, 12 placed, \
              refused at 10 68 10: no block to place (put one above or below the builder)"
@@ -1385,8 +1517,78 @@ mod tests {
                 progress: Progress::default(),
                 refusal: None,
                 complete: false,
+                cells: None,
             }),
             "Builder at 10 64 10: card refused, shape of 134217728 cells past the 50000000-cell card limit"
+        );
+    }
+
+    #[test]
+    fn a_status_count_is_bounded_on_a_huge_sparse_shape() {
+        // A 499x499x499 sphere is sparse enough that a shell of candidates is mostly outside the
+        // shape. Counting all of them is ~124 million `contains` calls on the server thread, which
+        // is what the review measured; the readout now stops after STATUS_CANDIDATES candidates.
+        let sphere = card(Shape::Sphere, true, [499, 499, 499]);
+        let (shown, more) = sphere.count_within(MAX_PASS_CELLS, STATUS_CANDIDATES);
+        assert!(more, "the answer says the shape holds more");
+        assert!(shown <= STATUS_CANDIDATES, "it counted {shown} cells");
+        let small = card(Shape::Sphere, true, [199, 199, 199]);
+        let (whole, _) = small.count(MAX_PASS_CELLS);
+        let (small_shown, small_more) = small.count_within(MAX_PASS_CELLS, STATUS_CANDIDATES);
+        assert!(
+            small_more || small_shown <= whole,
+            "never more than the whole shape"
+        );
+        // The work bound is what stops it: with a slightly larger budget the same shape counts
+        // more cells, so the number is the budget's, not a constant.
+        let (bigger, _) = sphere.count_within(MAX_PASS_CELLS, STATUS_CANDIDATES * 2);
+        assert!(
+            bigger > shown,
+            "a bigger budget counts more: {bigger} vs {shown}"
+        );
+        // A box answers from its dimensions, exactly, and never inspects a cell: with no work
+        // budget at all it still answers.
+        let boxed = card(Shape::Box, true, [300, 300, 300]);
+        let (cells, more) = boxed.count_within(MAX_PASS_CELLS, 0);
+        assert_eq!(cells, MAX_PASS_CELLS);
+        assert!(more);
+    }
+
+    #[test]
+    fn the_readout_prints_the_count_it_was_given() {
+        // A cached count (the pass computed it once) is printed as it stands, so a repeated
+        // readout never re-walks the shape.
+        let sphere = Card {
+            shape: Shape::Sphere,
+            ..Card::default()
+        };
+        let with_cache = |cells: u64, more: bool| {
+            status_line(&Status {
+                at: [10, 64, 10],
+                card: Some(sphere),
+                refused_card: None,
+                progress: Progress::default(),
+                refusal: None,
+                complete: false,
+                cells: Some(CellCount { cells, more }),
+            })
+        };
+        assert_eq!(
+            with_cache(81, false),
+            "Builder at 10 64 10: Sphere (Solid) 5x5x5 offset 0 0 0, 81 cells, not started"
+        );
+        assert_eq!(
+            with_cache(1000, true),
+            "Builder at 10 64 10: Sphere (Solid) 5x5x5 offset 0 0 0, 1000 cells (first 1000 cells), \
+             not started"
+        );
+    }
+
+    #[test]
+    fn a_protected_cell_has_words_a_player_reads() {
+        assert_eq!(
+            RefusalReason::Protected.text(),
+            "protected (outside the world border)"
         );
     }
 
@@ -1418,6 +1620,7 @@ mod tests {
                 progress: Progress::default(),
                 refusal: None,
                 complete: false,
+                cells: None,
             }),
             "Builder at 0 64 0: Box (Solid) 300x300x300 offset 0 0 0, 2097152 cells \
              (first 2097152 cells), not started"

@@ -1,18 +1,10 @@
 {
   "category": "misc",
   "key": {
-    "B": {
-      "item": "minecraft:bricks"
-    },
-    "i": {
-      "tag": "c:ingots/iron"
-    },
-    "p": {
-      "item": "minecraft:paper"
-    },
-    "r": {
-      "item": "minecraft:redstone"
-    }
+    "B": "minecraft:bricks",
+    "i": "#c:ingots/iron",
+    "p": "minecraft:paper",
+    "r": "minecraft:redstone"
   },
   "pattern": [
     "pBp",

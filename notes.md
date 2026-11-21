@@ -26,10 +26,19 @@ One flat `.hmod` — `horizon-mod.toml` + `Cargo.toml` + `src/` + `assets/` +
 `compatibility.json` are retired with that container and are not recreated.
 
 Status: **ported-partial** — slice 1 (the Builder's shaped mode with its shape
-cards) is implemented, its 25 geometry tests and 8 glue tests (33 in all) are green, the SDK
-gate is green and the package is built; it has **not** been run in a
-launcher-built game on this machine (no `horizon-launcher` here — gap 1), so no
-in-game claim is made. The gap list below is the rest of the mod.
+cards) and slice 2 (the carried recipes repaired to the 26.3 dialect and proven
+in game) are implemented, their 29 runtime tests and 9 glue tests (38 in all)
+are green, the SDK gate is green, and the package is **verified in a
+launcher-built game**: the modded leg passes, the unmodded control and the
+selftest both fail. The gap list below is the rest of the mod.
+
+Package at **0.2.2**: **56,154 B**, SHA-256
+`f09026b0f9f9cc91a2204f9231b07a595e62cda9f18e80ab46601ad049c5e872`, built twice
+byte-identically against SDK **`0a875da9…`** + mixins `e59da90…` (`check` exit 0,
+`fits` `made for` at the pin and `fits` at `0b14f8a`). The command → exact-output →
+log table for every number below is [`VALIDATION.md`](VALIDATION.md);
+the canonical logs are `sdk-test.log`, `sdk-fits.log`, `sdk-fits-other.log`, and the
+0.2.0 measurements are retired in `evidence/rftoolsbuilder/retired-0.2.0/`.
 
 ## Class + tier and the approach
 
@@ -279,14 +288,274 @@ difference from the artifact.
    `wait = true`; the port has no GUI to turn it off, so it always waits at a
    cell it has no block for rather than skipping it.
 
+## Review fixes (2026-11-18) — the registry's source review, package 0.2.1
+
+The reviewer's file is `var/review/1276-rftoolsbuilder.md` (**held: this blocked listing**). New
+package: **`rftoolsbuilder.hmod` — 56,192 B, sha256
+`da48b02d137e8d6cbf8df87536feb417ed7e4b02761f84b9e620cef314d627a6`**, rebuilt twice
+byte-identically, `check` = `rftoolsbuilder 0.2.1 (native-mod, …)`, `fits --build nightly` =
+`0b14f8a made for`, **38 unit tests**. **The in-game leg is green**: `PASS` + `EXIT:0`, with a
+control and a selftest leg that both fail without it (item 6).
+
+### 1. `status` enumerated a player-configured shape synchronously (unbounded work)
+
+**Reproduced** (`src/runtime.rs:877` in 0.2.0 → `Card::count(MAX_PASS_CELLS)`): a non-box shape
+enumerates its **whole validated box**, up to the 50,000,000-cell card limit, to collect at most
+2,097,152 cells. A sparse shape (a sphere, a torus) therefore asked `contains` ~124 million times on
+the server thread for one chat command.
+
+**Fixed** with a **work budget and a cache**, the two things the review asked for:
+
+- `Card::count_within(cap, work)` and `Card::cells_within(origin, cap, work)` bound the number of
+  **candidates inspected**, not just the cells kept: [`STATUS_CANDIDATES`] = 250,000. A box is
+  still answered from its dimensions and inspects nothing.
+- the pass computes its count **once** when it starts and stores it in the block entity
+  (`cells`, `cellsMore`), so a repeated `/rftoolsbuilder status` reads the cache and costs nothing;
+  `Status::cells` carries it and `status_line` prints it (the `(first N cells)` suffix now names the
+  number actually counted).
+- a count cut short by the budget prints `(first 250000 cells)` — "at least this many", never a
+  silent half-count.
+
+**Pinned by** `a_status_count_is_bounded_on_a_huge_sparse_shape` (a 499³ sphere: the bounded answer
+stops at the budget, says there are more, and a doubled budget counts more — so the number is the
+budget's, not a constant; a 300³ box answers exactly with a work budget of 0) and
+`the_readout_prints_the_count_it_was_given` (byte-stable with and without a cached count).
+
+### 2. Material-consuming placements could write protected cells
+
+**Reproduced** (`src/support.rs:656` in 0.2.0): `place()` took a block from the container and wrote
+it with the actor-free `LevelRef::set_block`, which performs **no** protection check.
+
+**Fixed** with a gate that runs **before anything is read or taken**: `cell_protected()` checks the
+world's bounds and the **world border** (`LevelRef::world_border`), and a protected cell is *skipped*
+(`progress.skipped`), never built and never charged a block. `RefusalReason::Protected` names it in
+the readout. The pin exposes **no** `ServerLevel.mayInteract` helper and no spawn-protection read
+(`surface.json` has no such identifier; the engine keeps the radius in its LAN host and only for a
+player's own interaction), so spawn protection is a recorded gap rather than a claim — see
+`## Gaps`.
+
+**Pinned by** `a_protected_cell_has_words_a_player_reads`, and in game by the new e2e phase: with
+`worldborder set 1` and a card offset 8 blocks away, the Builder builds **0** cells out there and
+the chest above it keeps **every** block it held.
+
+### 3. `status` disclosed arbitrary loaded block ids
+
+**Reproduced** (`src/support.rs:1092` in 0.2.0): with no Builder at the coordinates the command
+answered `minecraft:furnace: not a builder`, naming whatever a player pointed it at.
+
+**Fixed**: the refusal is now the generic `not a builder`. **Pinned by** the counterfactual leg of
+the e2e, which now also fails if the reply contains `minecraft:furnace`.
+
+### 4. Entry `kind`, upstream link, licence
+
+The **package** side was already right and is unchanged: `horizon-mod.toml` has `[native]` (game
+26.3, horizon `0b14f8a…`, mixins `e59da90…`), `license = "MIT"`, `homepage` and `issues` pointing at
+`https://github.com/McJtyMods/RFToolsBuilder`, and `check` reports `native-mod`. The entry's
+`kind = "native-mod"` and the original-project link are the orchestrator's edit.
+
+### 5. A build defect found on the way: the `horizon-core` path dependency
+
+The port depended on `.horizon/sdk/api/crates/horizon-core` for `JavaString` (a compound's key
+type). `horizon-launcher native-build` refused it — `error: No such file or directory (os error 2)` —
+because the launcher stages only the API crate. The key is now taken from `Tag::String`'s own
+payload (the `key!` macro, the same conversion `moderndynamics` uses), and the package has the one
+SDK dependency again.
+
+### 6. The card slot moved to saved data; the "73 of 98" was the scenario's own stone
+
+**The card slot's seam (fixed).** The card used to live only in the container slot, and a click-time
+`BlockEntityRef::set_item_slot` was visible to that click's action bar and **invisible to the next
+command's read** (`no shape card` for an installed card); `set_changed` did not close it — the same
+seam `integratedcrafting` hit. The card now lives in the block entity's **saved data**
+(`cardItem` + `cardData`: the item id and the card's shape, size, offset, turn and corner
+selection) and is **mirrored into the container slot every tick**, an outside change folded back (a
+slot holding an id other than `cardShown`, the id last mirrored, wins). `install`, `take_card` and
+`status_at` all use the saved form; a second card swaps and the old one goes back to the player.
+
+**The shortfall was not the walk (measured, then fixed in the scenario).** 0.2.1's first green
+attempt read `98 cells, 73 placed, scan complete`, and 73 = 98 − 25. A unit reproduction of the
+tick's walk — `a_second_pass_over_a_hollow_box_visits_and_builds_every_cell`, a completed solid
+3×3×3 pass followed by a hollow 5×5×5 pass on the same Builder, driving `Scan::start`/`advance` with
+the same per-tick budgets — visits **all 98 shell cells and builds all 98**, so the walk was
+exonerated before anything was changed. Instrumenting the run then named the cells
+(`RFB-SKIP not-replaceable [x, y, z]`, probe since removed): the hollow box's **bottom face lay on
+the arena platform**, 25 stone cells a Builder must not replace. Lifting the box with
+`/rftoolsbuilder offset 0 2 0` left **6** cells of the *first pass's* own stone in the new shell's
+bottom layer, and the readout became the correct `98 cells, 92 placed, scan complete`:
+92 = 98 − 6. The port never under-visits; it skips what is already there.
+
+The phase now proves exactly that: `98 cells` (a solid 5×5×5 would be 125), **92 placed**, and the
+chest above losing exactly **92** blocks, so a walk that under-visits still fails.
+
+**Measured, all three legs** (`ports/_shared/evidence/rftoolsbuilder-e2e/`):
+
+| leg | command | result |
+|---|---|---|
+| modded | `ports/tools/launcher-game.sh run rftoolsbuilder` | **PASS** + `EXIT:0` |
+| control | `GAME=$CONTROL_GAME` (the same Nightly, no package) | `FAIL: cannot give rftoolsbuilder:builder: this game does not carry the package` + `EXIT:1` |
+| selftest | `SELFTEST=1` | `FAIL: built 24 cells, expected 25` + `EXIT:1` |
+
+`check-e2e-logs.py rftoolsbuilder-e2e --strict` → `logs=3 ok=3 missing-exit=0 bad-exit=0`.
+
+The leg's numbers, as the log prints them: `Box (Solid) 3x3x3 … 27 cells, 24 placed, scan complete`
+with the chest `64 → 40`; `Box (Hollow) 5x5x5 offset 0 2 0 … 98 cells, 92 placed, scan complete`
+against a full chest (exactly 92 taken); a shape wholly outside the world border `0 placed` with the
+chest untouched; the card taken back by a sneak click; the volume identical after a relaunch.
+
+### Ladder (0.2.1)
+
+| Step | Command | Result |
+|---|---|---|
+| unit tests | `cargo test --lib --offline` | **38 passed**, 0 failed (was 27; +11) |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, 0 warnings |
+| formatting | `cargo fmt --check` | clean |
+| package | `cargo horizon-mod build` twice | `56,192 B`, sha256 `da48b02d…14d627a6`, **byte-identical** |
+| registry check | `cargo horizon-mod check rftoolsbuilder.hmod` | `rftoolsbuilder 0.2.1 (native-mod, …)`, EXIT 0 |
+| fits | `cargo horizon-mod fits rftoolsbuilder.hmod --build nightly` | `0b14f8a made for`, EXIT 0 |
+| in-game | `ports/tools/launcher-game.sh run rftoolsbuilder` | **PASS** + `EXIT:0`; control and selftest `FAIL` + `EXIT:1`; `check-e2e-logs.py --strict` exit 0 (item 6) |
+
+## Carry defect fixed (0.2.2): both carried recipes were dead data
+
+The two recipe files were carried from the 1.21.1 jar with their **object-form
+ingredients** (`{"item": "minecraft:bricks"}`, `{"tag": "c:ender_pearls"}`).
+Horizon 26.3 reads a shaped recipe's ingredient as a **string** — a bare item id
+or a `#tag` (`data/minecraft/recipe/iron_block.json`: `"#": "minecraft:iron_ingot"`)
+— and refuses the object. The server log said it plainly at launch:
+
+```
+== game log (rftoolsbuilder 0.2.2 before the fix): every rejected recipe ingredient ==
+recipes: invalid ingredient (unresolved tag or malformed input): {"item":"minecraft:bricks"}
+recipes: invalid ingredient (unresolved tag or malformed input): {"item":"minecraft:paper"}
+recipes: invalid ingredient (unresolved tag or malformed input): {"item":"minecraft:redstone"}
+recipes: invalid ingredient (unresolved tag or malformed input): {"item":"rftoolsbase:machine_frame"}
+recipes: invalid ingredient (unresolved tag or malformed input): {"tag":"c:ender_pearls"}
+recipes: invalid ingredient (unresolved tag or malformed input): {"tag":"c:ingots/iron"}
+```
+
+and the grid was right while the result slot stayed empty (`e2e-red-recipe.log`):
+
+```
+  shape card: 4 paper + 2 bricks + 1 iron ingot (c:ingots/iron) + 2 redstone -> null
+    grid: [{"count": 1, "item": "minecraft:paper", "slot": 100}, {"count": 1, "item": "minecraft:bricks", "slot": 101}, …]
+  builder: 4 bricks + 1 ender pearl (c:ender_pearls) + 3 redstone + machine frame -> null
+    grid: [{"count": 1, "item": "minecraft:bricks", "slot": 100}, … {"count": 1, "item": "rftoolsbase:machine_frame", "slot": 104}, …]
+FAIL: a carried recipe did not craft
+```
+
+**Fixed:** bare item ids and `#tag` strings, the shape the sibling ports
+(`rftoolsstorage`, `rftoolsutility`) already use:
+
+| file | before | after |
+|---|---|---|
+| `recipe/builder.json` | `{"item": "minecraft:bricks"}` / `{"item": "rftoolsbase:machine_frame"}` / `{"tag": "c:ender_pearls"}` / `{"item": "minecraft:redstone"}` | `"minecraft:bricks"` / `"rftoolsbase:machine_frame"` / `"#c:ender_pearls"` / `"minecraft:redstone"` |
+| `recipe/shape_card_def.json` | `{"item": "minecraft:bricks"}` / `{"tag": "c:ingots/iron"}` / `{"item": "minecraft:paper"}` / `{"item": "minecraft:redstone"}` | `"minecraft:bricks"` / `"#c:ingots/iron"` / `"minecraft:paper"` / `"minecraft:redstone"` |
+
+Nothing else in either file changed: the patterns, the results and the ids are
+the jar's. This is a **carry** defect, not an upstream one — the Java mod is
+correct for 1.21.1; the carry pipeline carried the dialect along with the data.
+
+**Two proofs, both fail-capable:**
+
+1. `tools/check_recipes.py` — a data guard over every `data/*/recipe/**/*.json`:
+   an ingredient must be a string (or a list of strings), the result must carry
+   a string id and a count of 1–99. Red before the fix
+   (`recipe-guard-red.log`): `FAIL: data/rftoolsbuilder/recipe/builder.json: key.B
+   is an object with item: {"item": "minecraft:bricks"}` ×8 in 2 files; green
+   after (`recipe-guard-green.log`): `recipes PASS: 2 carried recipe files use
+   26.3 bare item/tag ingredients`.
+2. `tools/craft_check.py`, called by `tools/e2e.sh` — both recipes are crafted in
+   a real crafting table, the result's id and count are asserted, the stack is
+   shift-clicked into the inventory, the grid must be empty and a distinctive
+   ingredient consumed; a wrong-ingredient control per recipe must leave the
+   result empty; and the game log must hold **no** `recipes: invalid ingredient`
+   line. The unmodded control and the selftest legs fail, so this cannot pass
+   vacuously.
+
+The Builder's recipe takes `rftoolsbase:machine_frame`, so the leg runs on a game
+carrying **both** packages — upstream declares rftoolsbase a required dependency
+and it is in the registry. `ports/_shared/evidence/rftoolsbuilder-e2e/bundle-game.sh`
+assembles it: a scratch copy of `ports/rftoolsbase` (its `[native] horizon` moved
+to this pin in the copy only — the port itself is read-only) and this port, built
+together with `horizon-launcher native-build <folder>`. Without rftoolsbase the
+frame cannot be given and `craft_check.py` says so instead of passing a half-check.
+
+## Slice 2 (0.2.2, 2026-11-21) — the in-game leg and its coverage
+
+The leg is `tools/e2e.sh` on the launcher-built two-package game, in The End for
+the item-count and break phases (no ambient drops, and no spawn protection to
+refuse a non-op player's break). Quoted from `e2e-package.log`:
+
+```
+== the carried recipes craft in a real crafting table ==
+  shape card: 4 paper + 2 bricks + 1 iron ingot (c:ingots/iron) + 2 redstone -> {"count": 1, "item": "rftoolsbuilder:shape_card_def", "slot": 200}
+  builder: 4 bricks + 1 ender pearl (c:ender_pearls) + 3 redstone + machine frame -> {"count": 1, "item": "rftoolsbuilder:builder", "slot": 200}
+  shape card with a stick where the paper goes -> null
+  builder with a stick where the ender pearl goes -> null
+recipe PASS: both carried shaped recipes craft with their declared id and count, their ingredients are consumed, the grid empties, and both wrong-ingredient controls leave the result empty
+recipe log: no 'invalid ingredient' line
+…
+status: Builder at 20 102 12: Box (Solid) 3x3x3 offset 8 0 0, 27 cells, 0 placed, scan complete; chest 256 -> 256
+…
+break reply: {"block":"minecraft:air","block_before":"rftoolsbuilder:builder[facing=north]","drops":{"rftoolsbuilder:builder":1},…}
+reset: Card reset to the jar's default: Box (Solid) 5x5x5 offset 0 0 0
+cards in the inventory after reset: 1
+PASS: both carried recipes craft in a real crafting table (…), the Builder fills its 3x3x3 box from the chest above it (24 placed, 64 -> 40), a hollow 5x5x5 is a 98-cell shell (92 placed against a full chest), a box outside the world border builds 0 and spends nothing, the Builder's loot table drops it, the card goes in, comes back out, resets to the 5x5x5 default, and the placed volume survives a relaunch
+EXIT:0
+```
+
+| leg | command | result | log |
+|---|---|---|---|
+| package | `GAME=<bundle game> tools/e2e.sh` | **PASS** + `EXIT:0` | `e2e-package.log` |
+| control (same Nightly, no package) | `GAME=$CONTROL_GAME` | `FAIL: cannot give rftoolsbuilder:builder: this game does not carry the package` + `EXIT:1` | `e2e-control.log` |
+| fail-capable | `SELFTEST=1` | `FAIL: built 24 cells, expected 25` + `EXIT:1` | `e2e-selftest.log` |
+| red proof (before the fix) | the same leg on 0.2.2 with object-form ingredients | `FAIL: a carried recipe did not craft` + `EXIT:1`, log lines above | `e2e-red-recipe.log`, `game-log-red-recipe.log` |
+| log gate | `check-e2e-logs.py rftoolsbuilder-e2e --strict` | `logs=7 ok=7 missing-exit=0 bad-exit=0` | — |
+
+**Coverage — every family this package ships** (ruling 2026-11-20):
+
+| family | status | proof |
+|---|---|---|
+| the two carried shaped recipes (`builder`, `shape_card_def`) | **tested** | `craft_check.py`: both craft their declared id and count, ingredients consumed, grid empty; a wrong-ingredient control each; no `invalid ingredient` line in the log |
+| the two `c:` tags (`c:ender_pearls`, `c:ingots/iron`) | **tested** | a recipe whose key is the tag crafts — an empty or unresolved tag refuses the recipe at load |
+| `rftoolsbuilder:builder` block and its `facing` | **tested** | placed and read back with a `facing`; an unknown id is refused by `give` |
+| `rftoolsbuilder:shape_card_def` item and its `shape_card` component | **tested** | given, written by `/rftoolsbuilder shape|offset|reset`, installed by a click, taken back by a sneak click |
+| the Builder's block entity and its card slot | **tested** | the installed card drives a 3×3×3 pass (24 placed of 27) and a hollow 5×5×5 shell (92 of 98), the chest loses exactly the blocks placed |
+| the walk and the placement | **tested** | 24 placed + 3 skipped = 27; 92 against a full chest; a box outside the world border places 0 and spends nothing |
+| the block's loot table | **tested** | broken in survival with an iron pickaxe in The End: `drops: {"rftoolsbuilder:builder": 1}`, the block becomes air |
+| `/rftoolsbuilder status` | **tested** | six readouts asserted byte-exactly (`no shape card`, `27 cells, 24 placed`, `98 cells, 92 placed offset 0 2 0`, `27 cells, 0 placed`, `not a builder`, the reset default) |
+| `/rftoolsbuilder shape`, `offset`, `reset` | **tested** | `Card set to Box (Solid) 3x3x3`, `Card offset set to 0 2 0`, `Card reset to the jar's default: Box (Solid) 5x5x5 offset 0 0 0` |
+| the 3×3×3 / 5×5×5 cubes, the arena | — | scenario scaffolding, not a mod family |
+| the quarry, movers, shields, space chamber, composer/projector/scanner, GUI, liquid cards, filter module, energy, chunk loading, HUD | **not ported** | gaps 2–13 below: each names the upstream class it waits on |
+
+### Ladder (0.2.2)
+
+Every step ran through `ports/tools/build-slot.sh` (one lease per step,
+`CARGO_INCREMENTAL=0`, no `--target-dir`); `BUILD_LOCAL=1` for the two steps that
+need `cargo horizon-mod` (the remote runner has no such subcommand installed).
+
+| Step | Command | Result | Log |
+|---|---|---|---|
+| recipe guard (RED) | `python3 tools/check_recipes.py .` before the fix | 8 old-shape ingredients in 2 files, exit 1 | `../_shared/evidence/rftoolsbuilder/recipe-guard-red.log` |
+| recipe guard | the same after the fix | `recipes PASS: 2 carried recipe files use 26.3 bare item/tag ingredients` | `recipe-guard-green.log` |
+| unit tests | `cargo test --offline` | **38 passed**, 0 failed (`unittests src/lib.rs`: `test result: ok. 38 passed; 0 failed`; doc-tests `0 passed`), exit 0 | `sdk-test.log` |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, 0 warnings | `clippy.log` |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | `FMT_EXIT:0` | `fmt.log` |
+| SDK gate | `cargo horizon-mod check` | `Made for 0a875da.` + `ModContainer: built with ..`, exit 0 | `check.log` |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` | `Built ./target/horizon-mod/rftoolsbuilder.hmod` | `build.log` |
+| package twice | the same again | **`cmp` identical** | `build2.log` |
+| registry check | `cargo horizon-mod check rftoolsbuilder.hmod` | `rftoolsbuilder 0.2.2 (native-mod, format native-1/0a875da…/e59da90…, for 26.3)`, 56,154 B, `f09026b0…e872`, exit 0 | `file-check-fits.log` |
+| fits, the pin | `cargo horizon-mod fits rftoolsbuilder.hmod --build 0a875da91dbb0fdcb7ba8c42c11341aa229af51a` | `0a875da  made for`, exit 0 | `sdk-fits.log` |
+| fits, **a different build** | `cargo horizon-mod fits rftoolsbuilder.hmod --build 0b14f8acfd97fa2c750e42795249dcc981178ca4` | `0b14f8a  fits`, exit 0 | `sdk-fits-other.log` |
+| package gate | `python3 ports/tools/verify-sdk-package.py rftoolsbuilder` | **1/1** (`31 entries`, no packed `Cargo.lock`) | — |
+| in-game | the three legs above | `PASS` + `EXIT:0`, control `EXIT:1`, selftest `EXIT:1` | `../_shared/evidence/rftoolsbuilder-e2e/*.log` |
+
 ## Gaps
 
-1. **No in-game run.** There is no `horizon-launcher` on this machine
-   (`which horizon-launcher` is empty), so no game carrying the package can be
-   built and `tools/e2e.sh` has **not** been run. The script is written for a
-   launcher-built game (`horizon-launcher native-build … --trust-native-code`)
-   and keeps a counterfactual (a furnace in the Builder's place) and a selftest
-   (26 solid cells for a 27-cell box) so the first run is fail-capable.
+1. ~~**No in-game run.**~~ **Closed 2026-11-21**: `ports/tools/launcher-game.sh` and
+   `horizon-launcher 0.2.92` build a game at this pin, and the leg runs on it
+   (`e2e-package.log` `PASS` + `EXIT:0`, control and selftest `EXIT:1`). The
+   script keeps the unmodded-game control, the `SELFTEST=1` leg and a
+   `COUNTERFACTUAL=1` furnace leg, so a first run is fail-capable.
 2. **The quarry**, its resource scan, silk/fortune drops, the void list and the
    replacement block (upstream `ShapeCardType.CARD_QUARRY*`).
 3. **The movers**, their controls and the vehicle builder (`modules/mover`).
@@ -310,8 +579,14 @@ difference from the artifact.
     (`updateHilight`, `IHudSupport`, `BuilderRenderer`).
 14. **The two recipes need `rftoolsbase:machine_frame`** (sibling port) and the
     `c:ender_pearls` / `c:ingots/iron` tags (declared here as the family does).
+    **Proven 2026-11-21** on a game carrying both packages
+    (`ports/_shared/evidence/rftoolsbuilder-e2e/bundle-game.sh`); the ingredient
+    itself is consumed by the craft.
 
 ## Verification
+
+Slice 1's run (0.2.0) is the table below; the current **0.2.2** numbers are in
+*Ladder (0.2.2)* above.
 
 Every command ran through `ports/tools/build-slot.sh` (one lease per step); logs
 in `ports/_shared/evidence/rftoolsbuilder/`. `/tmp` was full from other sessions'
@@ -330,7 +605,7 @@ work during this run, so `TMPDIR` was pointed at the port's own
 | package, twice | the same command again on the same tree | `cmp` clean — **byte-identical** | `build2.log` |
 | package check | `cargo horizon-mod check rftoolsbuilder.hmod` | `rftoolsbuilder 0.2.0 (native-mod, format native-1/0b14f8a/e59da90, for 26.3)` / **51,246 bytes**, SHA-256 `231e5d00…5777be`, unsigned / **FILE_CHECK_EXIT:0** | `file-check.log` |
 | uses | `cargo horizon-mod check rftoolsbuilder.hmod --uses` | **USES_EXIT:0** | `uses.json` |
-| fits | `cargo horizon-mod fits rftoolsbuilder.hmod --build nightly` | `RFTools Builder:` / `0b14f8a  made for` / **FITS_EXIT:0** | `fits.log` |
+| fits | `cargo horizon-mod fits rftoolsbuilder.hmod --build nightly` | `RFTools Builder:` / `0b14f8a  made for` / **FITS_EXIT:0** | `retired-0.2.0/fits.log` (0.2.0; that run's "nightly" was `0b14f8a`) |
 | package hash | `sha256sum rftoolsbuilder.hmod` | `231e5d00d134f8a622d0568b2096ff7306cb18e82ee5ce984a78f296505777be` | `sha256.txt` |
 | package entries | `unzip -Z1 rftoolsbuilder.hmod` | **31 files**: 22 content (`assets/` + `data/`), `horizon-mod.toml`, `Cargo.toml`, `src/{lib,runtime,support}.rs`, `uses.json`, `LICENSE`, `LICENSE-NOTICE.md`, `README.md`; **no `Cargo.lock`** | `package-entries.txt` |
 | carry diff | jar vs port, size + SHA-256 per file | 6 verbatim, 2 content-equal recipes, 1 rewritten loot table, 13 declared, the rest listed as out of scope | `carry-diff.txt` |
@@ -346,20 +621,39 @@ a turned heart, the jar's heightless hollow cylinder (12 for 5×1×5, 36 for
 and its readout, the walk over a straddling box, the scan's rebuild entry and its restart when a card changes under it, and
 the byte-stable readout in all six of its branches.
 
-**Not run:** the in-game e2e (gap 1).
+**In game:** the three legs of the slice-2 run above (`PASS` + `EXIT:0`, control
+and selftest `EXIT:1`) against the launcher-built two-package game at this pin.
 
 Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices,rust-port
 
-## Publishing (first publication)
+## Publishing
 
-MIT, rank 0. The artifact is `ports/rftoolsbuilder/rftoolsbuilder.hmod`
-(51,246 B, `231e5d00…5777be`), version **0.2.0** — the first publication of this
-mod, so the entry is a first `[[versions]]` record rather than a supersede of an
-earlier PR. Publishing still needs the maintainer's approval (ARCHITECTURE.md
-§8), and the PR body must say what the slice implements and what it does not
-(this file's slice boundary and gaps).
+MIT, rank 0. The current artifact is `ports/rftoolsbuilder/rftoolsbuilder.hmod`
+(**56,154 B**, `f09026b0f9f9cc91a2204f9231b07a595e62cda9f18e80ab46601ad049c5e872`),
+version **0.2.2** — an **update** of the entry this campaign owns (`Add
+rftoolsbuilder 0.2.0`, PR #1276, then 0.2.1 under review), so the PR title is
+`Update rftoolsbuilder 0.2.2` and the body names the superseded PR. Publishing
+still needs the maintainer's approval (ARCHITECTURE.md §8).
 
-**First-publication changelog:**
+**Changelog (0.2.2) — supersedes 0.2.1:**
+
+- **Both carried recipes craft.** They were carried in the 1.21.1
+  object-form-ingredient shape (`{"item": …}`, `{"tag": …}`), which 26.3 rejects
+  (`recipes: invalid ingredient`), so both were dead data — the grid filled and
+  the result slot stayed empty. They now use bare item ids and `#tag` strings,
+  and both were crafted in game with their ingredients consumed.
+- `tools/check_recipes.py`: a data guard that fails on an old-dialect ingredient,
+  so the regression cannot come back silently.
+- The in-game leg now also proves the block's loot table, the protected-cell rule
+  (a box outside the world border builds 0 and spends nothing) and
+  `/rftoolsbuilder reset`, and it runs on a game carrying `rftoolsbase` as well
+  (required for the Builder's machine-frame ingredient).
+- Pin moved to SDK **`0a875da9…`** (mixins unchanged); 38 tests, clippy
+  `-D warnings` clean, `check` 0, `fits` `made for` at the pin and `fits` at
+  `0b14f8a`; in game `PASS` + `EXIT:0`, unmodded control `EXIT:1`,
+  `SELFTEST=1` `EXIT:1`.
+
+**First-publication changelog (0.2.0, for reference):**
 
 - The Builder block and its shape card, on SDK 0.2 (`api = "0.2"`, game 26.3,
   Horizon `0b14f8a`, mixins `e59da90`).

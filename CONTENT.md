@@ -50,9 +50,13 @@ without RFToolsBase installed.
   `rftoolsbuilder:builder_data` is dropped (those components are not carried;
   the card slot spills on a break like any container).
 - `data/rftoolsbuilder/recipe/builder.json`,
-  `data/rftoolsbuilder/recipe/shape_card_def.json` — the jar's two recipes,
-  unchanged in content (the Builder's needs `rftoolsbase:machine_frame`, a
-  sibling port; recorded as a dependency, not a gap in this port's behaviour).
+  `data/rftoolsbuilder/recipe/shape_card_def.json` — the jar's two recipes with
+  their patterns and results unchanged; their **ingredients are rewritten to the
+  26.3 dialect** (bare ids and `#tag` strings instead of the 1.21.1
+  `{"item": …}` / `{"tag": …}` objects, which 26.3 refuses — see `notes.md`,
+  *Carry defect fixed*). The Builder's needs `rftoolsbase:machine_frame`, a
+  sibling port (recorded as a dependency, and proven in game on a game carrying
+  both packages).
 - `data/c/tags/item/ender_pearls.json`, `data/c/tags/item/ingots/iron.json` —
   the two `c:` tags the recipes name.
 - `data/minecraft/tags/block/mineable/pickaxe.json`,

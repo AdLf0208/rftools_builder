@@ -1,19 +1,10 @@
-# RFTools Builder — a Horizon port
+# RFTools Builder for Horizon
 
-**RFTools Builder** is a Minecraft mod. The RFTools Builder, Shield, Projector, Scanner,. This repository is a **port of it to [Horizon](https://github.com/horizon-rust/horizon)**, the Rust engine for Minecraft Java 26.3. It carries the complete source of the port plus the content files it ships, and installs as a single `.hmod` package.
+A Horizon native mod (mod API 0.2) that ports **RFTools Builder 1.21-7.0.8**
+(McJtyMods/RFToolsBuilder, MIT): the **Builder** block and its **shape cards**,
+and the shape geometry behind them.
 
-Upstream: [McJtyMods/RFToolsBuilder](https://github.com/McJtyMods/RFToolsBuilder) — licence **MIT**.
-
-| | |
-|---|---|
-| Upstream mod | RFTools Builder ([source](https://github.com/McJtyMods/RFToolsBuilder)) |
-| Ported to | Horizon 0b14f8a, Minecraft Java 26.3, mod API `0.2` |
-| Package | `rftoolsbuilder.hmod` (install it with the Horizon launcher) |
-| Licence | **MIT** — the upstream mod's licence; see [Licence and credit](#licence-and-credit) |
-
-## What this port implements
-
-### What this slice does
+## What this slice does
 
 - **The shape card** (`rftoolsbuilder:shape_card_def`) carries a shape, a size,
   an offset and solid/hollow in the `rftoolsbuilder:shape_card` component. The
@@ -37,47 +28,26 @@ Upstream: [McJtyMods/RFToolsBuilder](https://github.com/McJtyMods/RFToolsBuilder
 - The card goes into the Builder's card slot on a right click; an empty hand
   reads the Builder out; a sneaking empty hand takes the card back.
 
-## Not yet ported
+## What it does not do
 
-- **No in-game run.** There is no `horizon-launcher` on this machine
-- **The quarry**, its resource scan, silk/fortune drops, the void list and the
-- **The movers**, their controls and the vehicle builder (`modules/mover`).
-- **The shields** and their renderer (`modules/shield`).
-- **The space chamber**, copy/move/swap modes, support blocks and the entity
-- **Composer, projector and scanner**, hence `SHAPE_COMPOSITION` and
-- **The GUI** and the mod's own networking (`client/Gui*`, `network/*`).
-- **The liquid/pump cards** and fluid handling (`placeLiquidBlock`,
+The quarry (its resource scan, silk/fortune drops and replacement), the movers
+and their controls, the shields, the space chamber, the composer, the projector,
+the scanner, the GUI screens and the liquid/pump cards are **not** carried. The
+`GAPS` list in `notes.md` names each with the upstream file that implements it.
 
-## Installing
+## Building
 
-1. Install the [Horizon launcher](https://github.com/horizon-rust/horizon/releases) (0.2.70 or newer).
-2. Add `rftoolsbuilder.hmod` to the instance's mods.
-3. The package is pinned to a specific Horizon build; the launcher checks that pin.
-
-## Licence and credit
-
-RFTools Builder was created by its upstream authors; the code, models and assets in the original mod
-remain theirs and are used here under **MIT**. The Rust in this repository is a clean-room
-rewrite for Horizon, not a translation of the original source.
-
-- `LICENSE` — the upstream licence text.
-- `LICENSE-NOTICE.md` — what this port carries and where it came from.
-- The upstream project: https://github.com/McJtyMods/RFToolsBuilder
-
-## Technical details
-
-```
-horizon-mod.toml   package manifest (id, version, api, [native] pin)
-Cargo.toml         the crate; depends on `horizon-mod-api` from the fetched SDK
-src/               lib.rs (the one `impl Hooks`), runtime.rs (pure logic + tests), glue
-assets/ data/      the content the package ships
-tools/             content generators and the e2e scenario
+```sh
+cargo horizon-mod check          # the SDK gate (format + manifest + code)
+rm -f Cargo.lock && cargo horizon-mod build   # -> target/horizon-mod/rftoolsbuilder.hmod
+cp target/horizon-mod/rftoolsbuilder.hmod ./rftoolsbuilder.hmod
 ```
 
-- Build: `cargo horizon-mod build` (packages; it does not compile against the game).
-- Test: `cargo test`, `cargo clippy --all-targets -- -D warnings`.
-- In-game: `ports/tools/launcher-game.sh run rftoolsbuilder` in the campaign tree, or install the
-  `.hmod` and play; the harness scenario is `tools/e2e.sh`.
+`cargo test` runs the pure geometry and the glue's own tests without a game.
+`.horizon/sdk` is fetched per clone (gitignored) and never packed.
 
-This repository is generated from the campaign's port at `ports/rftoolsbuilder/`; the port's own
-`notes.md` is the full record (decisions, traps, evidence).
+## Licence
+
+MIT, from the jar's own `META-INF/neoforge.mods.toml`; see [`LICENSE`](LICENSE)
+and [`LICENSE-NOTICE.md`](LICENSE-NOTICE.md). Carried art is upstream's, with
+its sizes and SHA-256 in `CONTENT.md`.
