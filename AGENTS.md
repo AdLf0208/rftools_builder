@@ -39,7 +39,9 @@ only because `horizon-mod-api` does not re-export `JavaString`.
 
 The in-game e2e needs a **launcher-built** game carrying the package, and the
 Builder's recipe takes `rftoolsbase:machine_frame`, so the game carries **both**
-packages (upstream declares rftoolsbase a required dependency):
+packages (upstream declares rftoolsbase a required dependency). The leg also runs
+the quarry card type (0.2.3): `SELFTEST=quarry` flips its replacement assertion and
+must exit 1.
 
 ```sh
 ports/_shared/evidence/rftoolsbuilder-e2e/bundle-game.sh      # builds + exports it, prints the env
@@ -53,7 +55,9 @@ python3 ports/tools/check-e2e-logs.py rftoolsbuilder-e2e --strict
 
 `bundle-game.sh` copies `ports/rftoolsbase` into a scratch folder and moves the
 copy's `[native] horizon` to this pin — the port itself is read-only and never
-edited. `tools/craft_check.py` (called by `tools/e2e.sh`) crafts both recipes in
+edited. The quarry rig sets its Builder with `setblock` (the item-placement path is
+the first rig's), aims at its **south** face (the face the player stands on, not the
+block's own `facing`), and fills the volume *before* installing the card. `tools/craft_check.py` (called by `tools/e2e.sh`) crafts both recipes in
 a real table and `tools/check_recipes.py` is the data guard against the 1.21.1
 ingredient dialect.
 

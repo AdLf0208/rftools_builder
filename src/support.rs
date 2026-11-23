@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 
 use mod_api::{
     self, BlockEntityEvent, BlockEntityPart, BlockEntityRef, BlockEntityTickEvent,
-    BlockEntityTicksEvent, BlockKey, BlockPart, BlockUpdateFlags, Capability, Command,
+    BlockEntityTicksEvent, BlockKey, BlockPart, BlockState, BlockUpdateFlags, Capability, Command,
     CommandArgumentValue, Component, Compound, Flow, Hand, Host, HostBlockStates, HostSide,
     HostTransaction, ITEMS, Identifier, InteractionResult, ItemPart, ItemResource, ItemStack,
     LevelRef, LevelSide, ModContainer, PlayerRef, RegisterCommandsEvent, Registrar,
@@ -23,8 +23,9 @@ use mod_api::{
 };
 
 use crate::runtime::{
-    self, BLOCKS_PER_TICK, Card, LOOKUPS_PER_TICK, Progress, Refusal, RefusalReason, Scan, Shape,
-    Status,
+    self, BLOCKS_PER_TICK, BUILDER_CELLS, Card, CardKind, CellFacts, DONT_REMOVE_ME, FORTUNE_LEVEL,
+    LOOKUPS_PER_TICK, Progress, QUARRY_REPLACE, QUARRY_TOOL, Quarry, QuarryStep, Refusal,
+    RefusalReason, Scan, Shape, Status, Voiding,
 };
 
 /// The compound key type, taken from `Tag::String`'s own payload: the API does not re-export the
@@ -74,6 +75,13 @@ const K_SELECTED: &str = "selected";
 const K_SELECTED_DIMENSION: &str = "selectedDimension";
 /// `ShapeCardDimensions.corner1`: the first corner picked.
 const K_CORNER1: &str = "corner1";
+/// The card's type (`ShapeCardType`): the jar reads it from the item id, and this port
+/// carries one card item, so it rides the component. No upstream data field exists for it.
+const K_TYPE: &str = "type";
+/// `ShapeCardData.tagMatching`: expand the void list through each material's block tag.
+const K_TAG_MATCHING: &str = "tagMatching";
+/// `ShapeCardData.voiding`: the material keys the card's quarry collects nothing for.
+const K_VOIDING: &str = "voiding";
 
 // --- block-entity keys -----------------------------------------------------
 /// The walking cursor; absent while there is no pass to resume.
@@ -104,6 +112,12 @@ const K_CARD_DATA: &str = "cardData";
 /// The item id the Builder last mirrored into its container slot: a slot holding anything else was
 /// changed from outside and wins.
 const K_CARD_SHOWN: &str = "cardShown";
+/// `BuilderConfiguration.quarryReplace`: what this Builder's quarry leaves behind, as a block
+/// id. The jar keeps it in a server config; the port keeps it per Builder (deviation,
+/// `notes.md`), defaulting to the jar's own value.
+const K_REPLACE: &str = "quarryReplace";
+/// Quarry cells whose block was removed without its drops being collected.
+const K_VOIDED: &str = "voided";
 
 /// The card's refusal codes in the saved compound.
 const REFUSAL_NONE: i8 = 0;
@@ -113,6 +127,10 @@ const REFUSAL_NO_MATERIAL: i8 = 1;
 const REFUSAL_OUT_OF_WORLD: i8 = 2;
 /// `RefusalReason::Protected`.
 const REFUSAL_PROTECTED: i8 = 3;
+/// `RefusalReason::NoRoom`.
+const REFUSAL_NO_ROOM: i8 = 4;
+/// `RefusalReason::Unloaded`.
+const REFUSAL_UNLOADED: i8 = 5;
 
 /// The block key the hooks compare the loaded block against. A `BlockKey` only
 /// names itself through a host, so it is asked for once, at registration.
@@ -288,6 +306,28 @@ fn card_of(data: &Compound) -> Card {
                 })
                 .unwrap_or(default.modifier.flip_y),
         },
+        // A card with no type is the jar's `shape_card_def` (`CARD_SHAPE`); a type this
+        // slice does not carry (`void`, `pump`, …) reads as a shape card rather than
+        // silently growing a behaviour.
+        kind: string(data, K_TYPE)
+            .and_then(|name| CardKind::parse(&name))
+            .unwrap_or(default.kind),
+        voiding: match data.get(&key!(K_VOIDING)) {
+            Some(Tag::List(values)) => {
+                Voiding::from_names(values.iter().filter_map(|tag| match tag {
+                    Tag::String(text) => Some(text.to_string_lossy()),
+                    _ => None,
+                }))
+            }
+            _ => default.voiding,
+        },
+        tag_matching: data
+            .get(&key!(K_TAG_MATCHING))
+            .and_then(|tag| match tag {
+                Tag::Byte(flag) => Some(*flag != 0),
+                _ => None,
+            })
+            .unwrap_or(default.tag_matching),
     }
 }
 
@@ -302,6 +342,14 @@ fn put_card(data: &mut Compound, card: Card) {
         Tag::String(card.modifier.rotation.id().into()),
     );
     data.insert(key!(K_FLIP_Y), Tag::Byte(i8::from(card.modifier.flip_y)));
+    data.insert(key!(K_TYPE), Tag::String(card.kind.suffix().into()));
+    data.insert(key!(K_TAG_MATCHING), Tag::Byte(i8::from(card.tag_matching)));
+    let voiding: Vec<Tag> = card
+        .voiding
+        .iter()
+        .map(|name| Tag::String(name.into()))
+        .collect();
+    data.insert(key!(K_VOIDING), Tag::List(voiding));
 }
 
 /// The card in the Builder's slot, as its saved compound holds it: the item id and the card's own
@@ -466,6 +514,8 @@ impl State {
                 Some(RefusalReason::OutOfWorld)
             }
             Some(Tag::Byte(code)) if *code == REFUSAL_PROTECTED => Some(RefusalReason::Protected),
+            Some(Tag::Byte(code)) if *code == REFUSAL_NO_ROOM => Some(RefusalReason::NoRoom),
+            Some(Tag::Byte(code)) if *code == REFUSAL_UNLOADED => Some(RefusalReason::Unloaded),
             _ => None,
         }
         .map(|reason| Refusal {
@@ -478,6 +528,7 @@ impl State {
             progress: Progress {
                 placed: number(K_PLACED).unwrap_or(0),
                 skipped: number(K_SKIPPED).unwrap_or(0),
+                voided: number(K_VOIDED).unwrap_or(0),
             },
             done: matches!(nbt.get(&key!(K_DONE)), Some(Tag::Byte(1))),
             refusal,
@@ -514,6 +565,10 @@ impl State {
             key!(K_SKIPPED),
             Tag::Long(i64::try_from(self.progress.skipped).unwrap_or(i64::MAX)),
         );
+        nbt.insert(
+            key!(K_VOIDED),
+            Tag::Long(i64::try_from(self.progress.voided).unwrap_or(i64::MAX)),
+        );
         nbt.insert(key!(K_DONE), Tag::Byte(i8::from(self.done)));
         match self.cells {
             Some(cells) => {
@@ -534,6 +589,8 @@ impl State {
                     RefusalReason::NoMaterial => REFUSAL_NO_MATERIAL,
                     RefusalReason::OutOfWorld => REFUSAL_OUT_OF_WORLD,
                     RefusalReason::Protected => REFUSAL_PROTECTED,
+                    RefusalReason::NoRoom => REFUSAL_NO_ROOM,
+                    RefusalReason::Unloaded => REFUSAL_UNLOADED,
                 };
                 nbt.insert(key!(K_REFUSAL), Tag::Byte(code));
                 put_ints(nbt, K_REFUSAL_POS, refusal.at);
@@ -656,10 +713,14 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
         return;
     };
 
+    // The Builder's replacement block (`BuilderConfiguration.quarryReplace`), defaulted to the
+    // jar's own value when the compound does not carry one.
+    let replace = string(&event.entity.nbt, K_REPLACE).unwrap_or_else(|| QUARRY_REPLACE.to_owned());
+
     // One pass per card (notes.md, deviation 1): a card that is not the one
     // this pass belongs to starts a fresh pass at the top of the low corner,
     // and a finished pass stays finished until the card changes.
-    let fingerprint = fingerprint(card);
+    let fingerprint = fingerprint(card, &replace);
     if state.card.as_deref() != Some(fingerprint.as_str()) {
         // One bounded count per pass, kept in the block entity: a repeated readout is free, and
         // even the first one never walks a shape whose box holds tens of millions of cells.
@@ -690,9 +751,9 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
         return;
     }
 
-    let mut placed = 0;
+    let mut acted = 0;
     let mut steps = 0;
-    while placed < BLOCKS_PER_TICK && steps < LOOKUPS_PER_TICK {
+    while acted < BLOCKS_PER_TICK && steps < LOOKUPS_PER_TICK {
         let Some(cursor) = scan.cursor else {
             break;
         };
@@ -701,7 +762,50 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
             // The cell belongs to a player who may not be built in (outside the border): it is
             // skipped and no material is taken for it.
             state.progress.skipped += 1;
-        } else if card.contains(pos, cursor) {
+        } else if !card.contains(pos, cursor) {
+            // Not a cell of the shape: the walk looks past it.
+        } else if let CardKind::Quarry(quarry) = card.kind {
+            if !level.is_loaded(host, cursor) {
+                state.refusal = Some(Refusal {
+                    at: cursor,
+                    reason: RefusalReason::Unloaded,
+                });
+                break;
+            }
+            match quarry_cell(host, level, pos, cursor, quarry, &card, &replace) {
+                QuarryCell::Skip => state.progress.skipped += 1,
+                QuarryCell::Void => {
+                    acted += 1;
+                    state.progress.placed += 1;
+                    state.progress.voided += 1;
+                    state.refusal = None;
+                }
+                QuarryCell::Harvested => {
+                    acted += 1;
+                    state.progress.placed += 1;
+                    state.refusal = None;
+                }
+                QuarryCell::NoRoom => {
+                    state.refusal = Some(Refusal {
+                        at: cursor,
+                        reason: RefusalReason::NoRoom,
+                    });
+                    // Stay on this cell: upstream's wait mode, and the block is not broken, so
+                    // nothing is lost while the container is full.
+                    state.cursor = Some(cursor);
+                    state.write(&mut event.entity.nbt);
+                    *event.reply = mod_api::BlockEntityTickReply::Changed;
+                    return;
+                }
+                QuarryCell::Unreadable => {
+                    state.refusal = Some(Refusal {
+                        at: cursor,
+                        reason: RefusalReason::Unloaded,
+                    });
+                    break;
+                }
+            }
+        } else {
             if !level.is_loaded(host, cursor) {
                 // Nothing can be read or written there; look again next tick.
                 state.refusal = Some(Refusal {
@@ -713,7 +817,7 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
             if is_replaceable(host, level, cursor) {
                 match place(host, level, pos, cursor) {
                     Placed::Yes => {
-                        placed += 1;
+                        acted += 1;
                         state.progress.placed += 1;
                         state.refusal = None;
                     }
@@ -749,17 +853,219 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
     }
 }
 
+/// What one quarry cell did.
+enum QuarryCell {
+    /// The block must not be broken here (air, the replacement, unbreakable, the Builder's own
+    /// box, the `dontremoveme` tag).
+    Skip,
+    /// The block was removed and its drops collected.
+    Harvested,
+    /// The block was removed and nothing was collected (the card's void list).
+    Void,
+    /// The drops do not fit in the container: wait here, break nothing.
+    NoRoom,
+    /// The cell's block could not be read.
+    Unreadable,
+}
+
+/// One quarry cell: the jar's `commonQuarryBlock`, then its `clearOrDirtBlock`.
+///
+/// **Upstream defect fixed.** The jar rolls and inserts a block's drops *before*
+/// `clearOrDirtBlock` reads the `rftoolsbuilder:dontremoveme` tag, and only then returns
+/// without removing the block (`BuilderTileEntity.java:1246` inserts, `:1109-1114` returns
+/// on the tag), so a tagged block hands out its drops on every pass while staying in place.
+/// The port skips a tagged block before anything is rolled.
+fn quarry_cell(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    builder: [i32; 3],
+    cursor: [i32; 3],
+    quarry: Quarry,
+    card: &Card,
+    replace: &str,
+) -> QuarryCell {
+    let Some(block_state) = level.block_state(host, cursor) else {
+        return QuarryCell::Unreadable;
+    };
+    let Some(block) = level.block(host, cursor) else {
+        return QuarryCell::Unreadable;
+    };
+    let id = block.id(&*host);
+    let near_builder = (0..3).all(|axis| (cursor[axis] - builder[axis]).abs() <= BUILDER_CELLS);
+    let facts = CellFacts {
+        near_builder,
+        air: runtime::is_air_block(&id),
+        destroy_speed: host
+            .block_states()
+            .destroy_speed(block_state)
+            .unwrap_or(-1.0),
+        is_replacement: id == replace,
+        voided: is_voided(&*host, card, block, &id),
+    };
+    let step = runtime::quarry_step(quarry, facts);
+    if step == QuarryStep::Skip(runtime::SkipReason::Empty) {
+        return QuarryCell::Skip;
+    }
+    // The tag upstream leaves in place; checked before any drop is rolled (the defect above).
+    if host.block_in_tag(block, DONT_REMOVE_ME).unwrap_or(false) {
+        return QuarryCell::Skip;
+    }
+    let mut collected = false;
+    if step == QuarryStep::Harvest {
+        if !insert_drops(host, level, builder, cursor, quarry) {
+            return QuarryCell::NoRoom;
+        }
+        collected = true;
+    }
+    if !clear_or_replace(host, level, cursor, block_state, quarry.clearing, replace) {
+        return QuarryCell::Skip;
+    }
+    if collected {
+        QuarryCell::Harvested
+    } else {
+        QuarryCell::Void
+    }
+}
+
+/// Whether the card's void list covers the block at this cell: its material by its own id, or,
+/// with the card's `tagMatching` on, a member of that material's block tag
+/// (`ShapeCardItem.getVoidedBlocks`).
+fn is_voided(host: &dyn Host, card: &Card, block: BlockKey, id: &str) -> bool {
+    if let Some(material) = runtime::material_of(id)
+        && card.voiding.contains(material)
+    {
+        return true;
+    }
+    if !card.tag_matching {
+        return false;
+    }
+    runtime::VOID_MATERIALS.iter().any(|material| {
+        card.voiding.contains(material)
+            && host
+                .block_in_tag(block, runtime::tag_of(material))
+                .unwrap_or(false)
+    })
+}
+
+/// Rolls the block's drops at `at` — silk touch, fortune III or plain, with the jar's super
+/// harvesting tool — and puts them into the container above the Builder, else below it.
+/// Returns whether they all fit; nothing is taken out of the world here.
+fn insert_drops(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    builder: [i32; 3],
+    at: [i32; 3],
+    quarry: Quarry,
+) -> bool {
+    let tool = quarry_tool(host, quarry);
+    let Ok(Some(drops)) = level.block_drops(host, at, tool.as_ref(), None) else {
+        return false;
+    };
+    for stack in &drops {
+        let resource = ItemResource::of(stack);
+        let mut left = stack.count();
+        for offset in [1, -1] {
+            if left == 0 {
+                break;
+            }
+            let container = [builder[0], builder[1] + offset, builder[2]];
+            if !level.is_loaded(host, container) {
+                continue;
+            }
+            let Some(handler) = level.capability(host, &ITEMS, container, None) else {
+                continue;
+            };
+            let went = host
+                .transaction(|host, tx| {
+                    Ok::<u32, ()>(handler.insert_any(host, tx, &resource, left))
+                })
+                .unwrap_or(0);
+            left = left.saturating_sub(went);
+        }
+        if left > 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// The stack a quarry harvests with: a netherite pickaxe (`SuperHarvestingTool` is
+/// `Tiers.NETHERITE` over `mineable/pickaxe`) carrying silk touch when the card asks for it and
+/// fortune III when it asks for that (`getHarvesterTool`).
+fn quarry_tool(host: &mut dyn ServerHost, quarry: Quarry) -> Option<ItemStack> {
+    let key = host.item_key(&Identifier::parse_namespaced(QUARRY_TOOL)?)?;
+    let mut stack = ItemStack::of(key);
+    let mut levels = Compound::new();
+    if quarry.silk {
+        levels.insert(key!("minecraft:silk_touch"), Tag::Int(1));
+    }
+    if quarry.fortune {
+        levels.insert(
+            key!("minecraft:fortune"),
+            Tag::Int(i32::try_from(FORTUNE_LEVEL).unwrap_or(1)),
+        );
+    }
+    if levels.is_empty() {
+        return Some(stack);
+    }
+    let mut patch = Compound::new();
+    patch.insert(key!("minecraft:enchantments"), Tag::Compound(levels));
+    stack.set_components(patch).ok()?;
+    Some(stack)
+}
+
+/// `clearOrDirtBlock`: the block's break sound, then air when the card is clearing or the
+/// Builder's replacement block (`Block.UPDATE_CLIENTS`, as upstream writes it — no neighbour
+/// update).
+fn clear_or_replace(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    state: BlockState,
+    clearing: bool,
+    replace: &str,
+) -> bool {
+    if let Some(sound) = host.block_states().sound(state) {
+        level.play_sound(
+            host,
+            sound.break_sound.as_ref(),
+            [
+                f64::from(pos[0]) + 0.5,
+                f64::from(pos[1]) + 0.5,
+                f64::from(pos[2]) + 0.5,
+            ],
+            SoundSource::Blocks,
+            sound.volume,
+            sound.pitch,
+        );
+    }
+    let id = if clearing { "minecraft:air" } else { replace };
+    let Some(block) = host.block_key(id) else {
+        return false;
+    };
+    let Some(target) = host.block_state_default(block) else {
+        return false;
+    };
+    level
+        .set_block(host, pos, target, BlockUpdateFlags::CLIENTS)
+        .unwrap_or(false)
+}
+
 /// What identifies the card a pass belongs to: its shape, solidity, size,
-/// offset and turn, so re-writing any of them starts a new pass.
-fn fingerprint(card: Card) -> String {
+/// offset and turn, plus what changes a quarry's work (its type, its void list and the
+/// Builder's replacement block), so re-writing any of them starts a new pass.
+fn fingerprint(card: Card, replace: &str) -> String {
     let [dx, dy, dz] = card.dimension;
     let [ox, oy, oz] = card.offset;
     format!(
-        "{}-{}-{dx}x{dy}x{dz}-{ox},{oy},{oz}-{}{}",
+        "{}-{}-{dx}x{dy}x{dz}-{ox},{oy},{oz}-{}{}-{}-{}-{}-{replace}",
         card.shape.id(),
         card.solid,
         card.modifier.rotation.id(),
-        if card.modifier.flip_y { "-flip" } else { "" }
+        if card.modifier.flip_y { "-flip" } else { "" },
+        card.kind.suffix(),
+        card.voiding.names(),
+        card.tag_matching
     )
 }
 
@@ -1173,6 +1479,7 @@ fn from_corners(corner1: [i32; 3], corner2: [i32; 3], builder: [i32; 3]) -> Card
         dimension,
         offset,
         modifier: runtime::Modifier::default(),
+        ..Card::default()
     }
 }
 
@@ -1229,6 +1536,18 @@ pub(crate) fn on_register_commands(event: &mut RegisterCommandsEvent<'_>) {
         "rftoolsbuilder offset <x:integer> <y:integer> <z:integer>",
     ));
     event.commands.push(Command::new("rftoolsbuilder reset"));
+    event
+        .commands
+        .push(Command::new("rftoolsbuilder type <type:word>"));
+    event
+        .commands
+        .push(Command::new("rftoolsbuilder void <material:word>"));
+    event
+        .commands
+        .push(Command::new("rftoolsbuilder tagmatching <mode:word>"));
+    event.commands.push(Command::new(
+        "rftoolsbuilder replace <pos:block_pos> <block:resource:minecraft:block>",
+    ));
 }
 
 /// Their bodies (`run_mod_command`).
@@ -1281,8 +1600,138 @@ pub(crate) fn on_run_mod_command(
             );
             Flow::Cancel
         }
+        "type" => {
+            let line = write_type(host, event);
+            feedback(host, &line);
+            Flow::Cancel
+        }
+        "void" => {
+            let line = write_void(host, event);
+            feedback(host, &line);
+            Flow::Cancel
+        }
+        "tagmatching" => {
+            let line = write_tag_matching(host, event);
+            feedback(host, &line);
+            Flow::Cancel
+        }
+        "replace" => {
+            let line = write_replace(host, event);
+            feedback(host, &line);
+            Flow::Cancel
+        }
         _ => Flow::Continue,
     }
+}
+
+/// `/rftoolsbuilder type <type>`: the card's `ShapeCardType` (the jar's item id picks it, and
+/// this port carries one card item, so the type rides the card).
+fn write_type(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> String {
+    let Some(CommandArgumentValue::String(name)) = event.command.argument("type") else {
+        return "usage: /rftoolsbuilder type <shape|quarry|quarry_silk|quarry_fortune|quarry_clear|quarry_clear_silk|quarry_clear_fortune>".to_owned();
+    };
+    let Some(kind) = CardKind::parse(name) else {
+        return format!(
+            "unknown card type '{name}'; try one of: shape, {}",
+            Quarry::ALL
+                .iter()
+                .map(|quarry| quarry.suffix())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    };
+    with_held_card(host, |data| {
+        data.card.kind = kind;
+        match kind {
+            CardKind::Shape => "Card type set to shape (places blocks)".to_owned(),
+            CardKind::Quarry(quarry) => format!(
+                "Card type set to {} ({}{})",
+                quarry.suffix(),
+                quarry.description(),
+                if quarry.clearing { ", clearing" } else { "" }
+            ),
+        }
+    })
+    .unwrap_or_else(|| "Hold a shape card in your main hand".to_owned())
+}
+
+/// `/rftoolsbuilder void <material>`: add a material to the card's void list (`none` clears
+/// it, `all` adds every material the jar knows).
+fn write_void(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> String {
+    let Some(CommandArgumentValue::String(material)) = event.command.argument("material") else {
+        return "usage: /rftoolsbuilder void <stone|cobble|dirt|sand|gravel|netherrack|endstone|none|all>".to_owned();
+    };
+    let material = material.trim().to_ascii_lowercase();
+    if material == "none" {
+        return with_held_card(host, |data| {
+            data.card.voiding = Voiding::empty();
+            "Card void list cleared".to_owned()
+        })
+        .unwrap_or_else(|| "Hold a shape card in your main hand".to_owned());
+    }
+    if material == "all" {
+        return with_held_card(host, |data| {
+            data.card.voiding = runtime::VOID_MATERIALS
+                .iter()
+                .fold(Voiding::empty(), |void, material| void.with(material));
+            "Card voids every material: stone, cobble, dirt, sand, gravel, netherrack, endstone"
+                .to_owned()
+        })
+        .unwrap_or_else(|| "Hold a shape card in your main hand".to_owned());
+    }
+    if !runtime::VOID_MATERIALS.contains(&material.as_str()) {
+        return format!(
+            "unknown material '{material}'; try one of: {}",
+            runtime::VOID_MATERIALS.join(", ")
+        );
+    }
+    with_held_card(host, |data| {
+        data.card.voiding = data.card.voiding.with(&material);
+        format!("Card voids {material}")
+    })
+    .unwrap_or_else(|| "Hold a shape card in your main hand".to_owned())
+}
+
+/// `/rftoolsbuilder tagmatching <on|off>`: `ShapeCardData.tagMatching`.
+fn write_tag_matching(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> String {
+    let mode = match event.command.argument("mode") {
+        Some(CommandArgumentValue::String(word)) if word.eq_ignore_ascii_case("on") => true,
+        Some(CommandArgumentValue::String(word)) if word.eq_ignore_ascii_case("off") => false,
+        _ => return "usage: /rftoolsbuilder tagmatching <on|off>".to_owned(),
+    };
+    with_held_card(host, |data| {
+        data.card.tag_matching = mode;
+        format!("Card tag matching {}", if mode { "on" } else { "off" })
+    })
+    .unwrap_or_else(|| "Hold a shape card in your main hand".to_owned())
+}
+
+/// `/rftoolsbuilder replace <pos> <block>`: the Builder's replacement block
+/// (`BuilderConfiguration.quarryReplace`, kept per Builder — `notes.md`).
+fn write_replace(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> String {
+    let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos") else {
+        return "usage: /rftoolsbuilder replace <x> <y> <z> <block>".to_owned();
+    };
+    let Some(CommandArgumentValue::Id(block)) = event.command.argument("block") else {
+        return "usage: /rftoolsbuilder replace <x> <y> <z> <block>".to_owned();
+    };
+    let pos = *pos;
+    if !is_builder(host, pos) {
+        return "not a builder".to_owned();
+    }
+    let Some(entity) = entity_at(host, pos) else {
+        return "not a builder".to_owned();
+    };
+    let mut data = entity.data(&*host).unwrap_or_default();
+    data.insert(
+        key!(K_REPLACE),
+        Tag::String(block.to_string().as_str().into()),
+    );
+    if entity.replace_data(host, data).is_err() {
+        return "the Builder could not take the replacement block".to_owned();
+    }
+    let _ = entity.set_changed(host);
+    format!("Builder replacement set to {block}")
 }
 
 /// `/rftoolsbuilder shape <shape> <dx> <dy> <dz> [solid|hollow]`.
@@ -1407,6 +1856,8 @@ fn status_at(host: &dyn Host, pos: [i32; 3]) -> String {
         refusal: state.refusal,
         complete: state.done,
         cells: state.cells,
+        replace: string(&entity.data(host).unwrap_or_default(), K_REPLACE)
+            .unwrap_or_else(|| QUARRY_REPLACE.to_owned()),
     })
 }
 
@@ -1425,6 +1876,13 @@ mod tests {
                 rotation: runtime::Rotation::Y,
                 flip_y: true,
             },
+            kind: CardKind::Quarry(Quarry {
+                silk: true,
+                fortune: false,
+                clearing: true,
+            }),
+            voiding: Voiding::empty().with("gravel").with("dirt"),
+            tag_matching: true,
         };
         let mut data = Compound::new();
         put_card(&mut data, card);
@@ -1517,6 +1975,13 @@ mod tests {
                     rotation: runtime::Rotation::Y,
                     flip_y: true,
                 },
+                kind: CardKind::Quarry(Quarry {
+                    silk: false,
+                    fortune: true,
+                    clearing: false,
+                }),
+                voiding: Voiding::empty().with("stone"),
+                tag_matching: false,
             },
             selection: Selection {
                 mode: 2,
@@ -1545,6 +2010,7 @@ mod tests {
             progress: Progress {
                 placed: 12,
                 skipped: 40,
+                voided: 2,
             },
             done: false,
             cells: Some(runtime::CellCount {
@@ -1579,11 +2045,21 @@ mod tests {
             shape: Shape::Sphere,
             ..Card::default()
         };
-        assert_eq!(fingerprint(card), fingerprint(card));
         assert_eq!(
-            fingerprint(card),
-            "SHAPE_SPHERE-true-5x5x5-0,0,0-0",
+            fingerprint(card, "minecraft:dirt"),
+            fingerprint(card, "minecraft:dirt")
+        );
+        assert_eq!(
+            fingerprint(card, "minecraft:dirt"),
+            "SHAPE_SPHERE-true-5x5x5-0,0,0-0-shape--false-minecraft:dirt",
             "the note the saved compound holds"
+        );
+        // What a quarry's pass depends on beyond its geometry: the type, the void list, the
+        // tag toggle and the Builder's replacement block.
+        assert_ne!(
+            fingerprint(card, "minecraft:dirt"),
+            fingerprint(card, "minecraft:cobblestone"),
+            "the replacement block is part of the pass"
         );
         for other in [
             Card {
@@ -1609,9 +2085,101 @@ mod tests {
                 },
                 ..card
             },
+            Card {
+                kind: CardKind::Quarry(Quarry {
+                    silk: false,
+                    fortune: false,
+                    clearing: false,
+                }),
+                ..card
+            },
+            Card {
+                voiding: Voiding::empty().with("stone"),
+                ..card
+            },
+            Card {
+                tag_matching: true,
+                ..card
+            },
         ] {
-            assert_ne!(fingerprint(card), fingerprint(other), "{other:?}");
+            assert_ne!(
+                fingerprint(card, "minecraft:dirt"),
+                fingerprint(other, "minecraft:dirt"),
+                "{other:?}"
+            );
         }
+    }
+
+    #[test]
+    fn the_card_component_round_trips_the_quarry_type_and_void_list() {
+        // A card that loses its type or its void list when it is moved is the defect this
+        // pins: the component, the saved data and the stack a Builder hands back all carry
+        // them.
+        let cards = [
+            Card {
+                kind: CardKind::Quarry(Quarry {
+                    silk: false,
+                    fortune: false,
+                    clearing: false,
+                }),
+                voiding: Voiding::empty().with("gravel").with("dirt"),
+                tag_matching: true,
+                ..Card::default()
+            },
+            Card {
+                kind: CardKind::Quarry(Quarry {
+                    silk: true,
+                    fortune: false,
+                    clearing: true,
+                }),
+                ..Card::default()
+            },
+            Card {
+                kind: CardKind::Quarry(Quarry {
+                    silk: false,
+                    fortune: true,
+                    clearing: true,
+                }),
+                voiding: Voiding::empty().with("endstone"),
+                ..Card::default()
+            },
+        ];
+        for card in cards {
+            let mut data = Compound::new();
+            put_card(&mut data, card);
+            assert_eq!(card_of(&data), card, "{card:?} survives its component");
+            // The jar's own field names and shapes: a string type and a string list.
+            assert_eq!(
+                string(&data, K_TYPE).as_deref(),
+                Some(card.kind.suffix()),
+                "the type is the card type's resource suffix"
+            );
+            match data.get(&key!(K_VOIDING)) {
+                Some(Tag::List(values)) => {
+                    let names: Vec<String> = values
+                        .iter()
+                        .filter_map(|tag| match tag {
+                            Tag::String(text) => Some(text.to_string_lossy()),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(names.join(", "), card.voiding.names());
+                }
+                other => panic!("voiding is a string list, got {other:?}"),
+            }
+        }
+        // A card with no type at all is the jar's `shape_card_def`, and an unknown type does
+        // not grow a behaviour this slice does not carry.
+        let mut bare = Compound::new();
+        put_card(&mut bare, Card::default());
+        assert_eq!(card_of(&bare).kind, CardKind::Shape);
+        let mut unknown = Compound::new();
+        put_card(&mut unknown, Card::default());
+        unknown.insert(key!(K_TYPE), Tag::String("pump".into()));
+        assert_eq!(card_of(&unknown).kind, CardKind::Shape);
+        let mut broken = Compound::new();
+        broken.insert(key!(K_VOIDING), Tag::String("not a list".into()));
+        assert!(card_of(&broken).voiding.is_empty());
     }
 
     #[test]

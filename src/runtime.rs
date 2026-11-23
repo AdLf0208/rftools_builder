@@ -6,10 +6,13 @@
 // `version=1.21-7.0.8`, the jar's own version). The upstream source was read for
 // behaviour only; this is a clean-room Rust rewrite.
 //
-// Slice 1 is the Builder's **shaped** mode: a shape card names a shape, a size,
-// an offset and whether the shape is solid or hollow, and the Builder places a
-// block into every replaceable cell of that shape. The quarry, the movers, the
-// shields, the space chamber and the composer are not carried (notes.md).
+// A shape card names a shape, a size, an offset and whether the shape is solid or
+// hollow, and the Builder places a block into every replaceable cell of that shape.
+// A **quarry** card is a card *type*, not a shape (`ShapeCardType.CARD_QUARRY*`): it
+// keeps the card's box and breaks what is in it, collecting the drops and leaving the
+// Builder's replacement block (or air, when the card clears); the card's void list
+// removes blocks without collecting them. The movers, the shields, the space chamber
+// and the composer are not carried (notes.md).
 //
 // Everything here is pure: no `mod_api` type, no host, no world. The glue in
 // `support.rs` reads the game, calls these rules and writes the result back.
@@ -50,6 +53,78 @@ pub const LOOKUPS_PER_TICK: u32 = 800;
 
 /// `ShapeCardData.DEFAULT_DIMENSIONS`: a fresh card is a 5×5×5 box.
 pub const DEFAULT_DIMENSION: [i32; 3] = [5, 5, 5];
+
+/// `BuilderConfiguration.quarryReplace`'s default: what a quarry leaves behind when the
+/// card is not clearing. The jar's value is a server config; this port keeps it per Builder
+/// (there is no config file in the package format yet — `notes.md`).
+pub const QUARRY_REPLACE: &str = "minecraft:dirt";
+/// The tool the quarry harvests with. Upstream's `SuperHarvestingTool` is
+/// `new DiggerItem(Tiers.NETHERITE, BlockTags.MINEABLE_WITH_PICKAXE, …)`, so a netherite
+/// pickaxe is the same item in everything the loot tables read.
+pub const QUARRY_TOOL: &str = "minecraft:netherite_pickaxe";
+/// `getHarvesterTool(…, …, fortune)`: the level a fortune quarry's tool carries
+/// (`int fortune = getCardType().isFortune() ? 3 : 0`).
+pub const FORTUNE_LEVEL: u32 = 3;
+/// `commonQuarryBlock`'s own guard: a 3×3×3 box around the Builder is never quarried.
+pub const BUILDER_CELLS: i32 = 1;
+/// `BuilderTileEntity.DONT_REMOVE_ME`, a block tag upstream creates and ships no members
+/// for: a block a pack marks with it is never removed (the port also never rolls its
+/// drops — upstream's order did, see `notes.md`).
+pub const DONT_REMOVE_ME: &str = "rftoolsbuilder:dontremoveme";
+
+/// The three blocks `BlockState.isAir()` answers true for.
+pub const AIR_BLOCKS: [&str; 3] = ["minecraft:air", "minecraft:cave_air", "minecraft:void_air"];
+
+/// Whether a block id is air (`BlockState.isAir`, which covers the three air blocks).
+#[must_use]
+pub fn is_air_block(block: &str) -> bool {
+    AIR_BLOCKS.contains(&block)
+}
+
+/// `ShapeCardItem.getVoidedBlocks`'s material keys, in the jar's own order.
+pub const VOID_MATERIALS: [&str; 7] = [
+    "stone",
+    "cobble",
+    "dirt",
+    "sand",
+    "gravel",
+    "netherrack",
+    "endstone",
+];
+
+/// The material key a block belongs to by its own id: `getVoidedBlocks` adds exactly
+/// `Blocks.STONE` for `stone`, `Blocks.COBBLESTONE` for `cobble`, `Blocks.DIRT` **and**
+/// `Blocks.GRASS_BLOCK` for `dirt`, and one block for each other key. A block that is only
+/// a tag member is not named here — that is what the card's tag matching is for.
+#[must_use]
+pub fn material_of(block: &str) -> Option<&'static str> {
+    Some(match block {
+        "minecraft:stone" => "stone",
+        "minecraft:cobblestone" => "cobble",
+        "minecraft:dirt" | "minecraft:grass_block" => "dirt",
+        "minecraft:sand" => "sand",
+        "minecraft:gravel" => "gravel",
+        "minecraft:netherrack" => "netherrack",
+        "minecraft:end_stone" => "endstone",
+        _ => return None,
+    })
+}
+
+/// The block tag a material expands to when the card's `tagMatching` is on
+/// (`Tags.Blocks.STONES`, `COBBLESTONES`, `BlockTags.DIRT`, `SANDS`, `GRAVELS`,
+/// `NETHERRACKS`, `END_STONES`).
+#[must_use]
+pub fn tag_of(material: &str) -> &'static str {
+    match material {
+        "stone" => "c:stones",
+        "cobble" => "c:cobblestones",
+        "dirt" => "minecraft:dirt",
+        "sand" => "c:sands",
+        "gravel" => "c:gravels",
+        "netherrack" => "c:netherracks",
+        _ => "c:end_stones",
+    }
+}
 
 /// The shapes a card can name (`mcjty.rftoolsbuilder.shapes.Shape` minus the
 /// three this slice does not carry: composition, scan, and the space card).
@@ -100,10 +175,84 @@ pub struct Modifier {
     pub flip_y: bool,
 }
 
+/// One quarry card type (`ShapeCardType.CARD_QUARRY*`): the three flags that decide what
+/// `commonQuarryBlock` does to a cell. `silk` is upstream's handler choice
+/// (`silkQuarryBlock` vs `quarryBlock`), `fortune` its `isFortune()` and `clearing` its
+/// `isClearing()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Quarry {
+    /// `silkQuarryBlock`: harvest with silk touch.
+    pub silk: bool,
+    /// `isFortune()`: harvest with fortune III.
+    pub fortune: bool,
+    /// `isClearing()`: leave air behind instead of the replacement block.
+    pub clearing: bool,
+}
+
+/// The card's type: upstream's `ShapeCardType`, which the jar reads from the **item id**
+/// (`ShapeCardItem.type`). This port carries one card item, so the type rides the card's
+/// own component (a documented deviation, `notes.md`); a card with none is upstream's
+/// `shape_card_def`, `CARD_SHAPE`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CardKind {
+    /// `CARD_SHAPE`: place a block into every cell of the shape.
+    #[default]
+    Shape,
+    /// One of the six `CARD_QUARRY*`: break the cells' blocks.
+    Quarry(Quarry),
+}
+
+/// Which blocks a quarry card removes and collects nothing for (`getVoidedBlocks`).
+///
+/// Upstream keeps a `Set<String>` of the seven material keys; the port keeps the same keys
+/// in a bitset, so a card stays `Copy` and the component still stores the jar's string list.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Voiding(u8);
+
+/// What the quarry rule needs to know about one cell (`commonQuarryBlock`'s inputs).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CellFacts {
+    /// The cell is inside the Builder's own 3×3×3 box.
+    pub near_builder: bool,
+    /// `BlockState.isAir()`.
+    pub air: bool,
+    /// `BlockState.getDestroySpeed`: below zero means the block cannot be broken.
+    pub destroy_speed: f32,
+    /// The block is the Builder's replacement block.
+    pub is_replacement: bool,
+    /// The block is on the card's void list.
+    pub voided: bool,
+}
+
+/// What the quarry does at one cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuarryStep {
+    /// Nothing: the block stays, and no material is spent on it.
+    Skip(SkipReason),
+    /// Remove the block after clearing or replacing it, and **collect nothing** (it is on
+    /// the card's void list).
+    Void,
+    /// Roll the block's drops into the Builder's container, then clear or replace it.
+    Harvest,
+}
+
+/// Why a quarry skips a cell (`commonQuarryBlock`'s early returns).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipReason {
+    /// The Builder's own 3×3×3 box.
+    NearBuilder,
+    /// The cell is air: the jar's `forquarry` filter never puts it in the map.
+    Empty,
+    /// `getDestroySpeed < 0`: bedrock and the like.
+    Unbreakable,
+    /// The block is already the replacement block, and the card is not clearing.
+    Replacement,
+}
+
 /// One shape card's parameters: the subset of upstream's `ShapeCardData` that
-/// decides where a shape is. `channel`, `tagMatching`, `voiding`, `scanId`,
-/// `children`, `ghostBlock` and the corner-selection `mode` are not carried
-/// (notes.md).
+/// decides where a shape is. `channel`, `scanId`, `children`, `ghostBlock` and the
+/// corner-selection `mode` are not carried (notes.md); `kind`, `voiding` and
+/// `tag_matching` are the quarry's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Card {
     /// The shape this card draws.
@@ -116,6 +265,12 @@ pub struct Card {
     pub offset: [i32; 3],
     /// The card's turn and mirror.
     pub modifier: Modifier,
+    /// The card's type: a shape card builds, a quarry card breaks.
+    pub kind: CardKind,
+    /// The materials this card's quarry collects nothing for.
+    pub voiding: Voiding,
+    /// `ShapeCardData.tagMatching`: expand the void list through each material's block tag.
+    pub tag_matching: bool,
 }
 
 /// Why a card cannot be used.
@@ -140,6 +295,10 @@ pub enum RefusalReason {
     OutOfWorld,
     /// The cell is protected: outside the world border, or spawn-protected.
     Protected,
+    /// A quarry's drops do not fit in the container above or below it.
+    NoRoom,
+    /// The cell's chunk is not loaded, so it cannot be read or written this tick.
+    Unloaded,
 }
 
 /// The cell the Builder is waiting at, and why.
@@ -154,10 +313,14 @@ pub struct Refusal {
 /// How far one scan has got.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Progress {
-    /// Cells a block was placed into.
+    /// Cells a block was placed into (a shape card) or a block was broken in (a quarry).
     pub placed: u64,
-    /// Cells looked at that needed nothing (already filled, or not in the shape).
+    /// Cells looked at that needed nothing (already filled, not in the shape, or a quarry
+    /// cell it must not break).
     pub skipped: u64,
+    /// Quarry cells whose block was removed without its drops being collected (the card's
+    /// void list).
+    pub voided: u64,
 }
 
 /// A Builder's scan: where it looks next, and the box it walks.
@@ -177,7 +340,7 @@ pub struct Scan {
 }
 
 /// What a status readout says about one Builder.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Status {
     /// The Builder's position.
     pub at: [i32; 3],
@@ -195,6 +358,9 @@ pub struct Status {
     /// repeated `/rftoolsbuilder status` costs nothing. `None` computes it within
     /// [`STATUS_CANDIDATES`] candidates.
     pub cells: Option<CellCount>,
+    /// The Builder's replacement block (`BuilderConfiguration.quarryReplace`), as the block
+    /// entity holds it. Only a non-clearing quarry card prints it.
+    pub replace: String,
 }
 
 /// A shape's cell count as a readout prints it: the number found, and whether the shape holds
@@ -216,8 +382,211 @@ impl Default for Card {
             dimension: DEFAULT_DIMENSION,
             offset: [0, 0, 0],
             modifier: Modifier::default(),
+            kind: CardKind::Shape,
+            voiding: Voiding::empty(),
+            tag_matching: false,
         }
     }
+}
+
+impl Quarry {
+    /// The six `CARD_QUARRY*` constants, in the jar's enum order.
+    pub const ALL: &'static [Quarry] = &[
+        Quarry {
+            silk: false,
+            fortune: false,
+            clearing: false,
+        },
+        Quarry {
+            silk: true,
+            fortune: false,
+            clearing: false,
+        },
+        Quarry {
+            silk: false,
+            fortune: true,
+            clearing: false,
+        },
+        Quarry {
+            silk: false,
+            fortune: false,
+            clearing: true,
+        },
+        Quarry {
+            silk: true,
+            fortune: false,
+            clearing: true,
+        },
+        Quarry {
+            silk: false,
+            fortune: true,
+            clearing: true,
+        },
+    ];
+
+    /// The card type's resource suffix (`ShapeCardType.getResourceSuffix`), which is the
+    /// tail of the jar's item id (`rftoolsbuilder:shape_card_quarry_silk`).
+    #[must_use]
+    pub fn suffix(self) -> &'static str {
+        match (self.clearing, self.silk, self.fortune) {
+            (false, false, false) => "quarry",
+            (false, true, _) => "quarry_silk",
+            (false, false, true) => "quarry_fortune",
+            (true, false, false) => "quarry_clear",
+            (true, true, _) => "quarry_clear_silk",
+            (true, false, true) => "quarry_clear_fortune",
+        }
+    }
+
+    /// The quarry type a suffix names; the jar's item id (`shape_card_quarry_silk`) reads
+    /// too. `None` for anything that is not one of the six.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        let wanted = bare_name(name);
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|quarry| quarry.suffix() == wanted)
+    }
+
+    /// The header the HUD log prints (`hudLogEntry`), which the readout reuses.
+    #[must_use]
+    pub fn description(self) -> &'static str {
+        if self.fortune {
+            "Fortune quarry"
+        } else if self.silk {
+            "Silktouch quarry"
+        } else {
+            "Normal quarry"
+        }
+    }
+}
+
+impl CardKind {
+    /// The type's suffix, as the card's component stores it.
+    #[must_use]
+    pub fn suffix(self) -> &'static str {
+        match self {
+            CardKind::Shape => "shape",
+            CardKind::Quarry(quarry) => quarry.suffix(),
+        }
+    }
+
+    /// The card type a name names: the six quarry suffixes, or the plain shape card
+    /// (`shape`, `def`, `shape_card_def`).
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        if matches!(bare_name(name), "shape" | "def") {
+            return Some(CardKind::Shape);
+        }
+        Quarry::parse(name).map(CardKind::Quarry)
+    }
+}
+
+/// A card type name without the namespace and upstream's `shape_card_` item prefix:
+/// `rftoolsbuilder:shape_card_quarry_silk` and `quarry_silk` both read as `quarry_silk`.
+fn bare_name(name: &str) -> &str {
+    let bare = name
+        .trim()
+        .trim_start_matches('/')
+        .rsplit(':')
+        .next()
+        .unwrap_or_default();
+    bare.strip_prefix("shape_card_").unwrap_or(bare)
+}
+
+impl Voiding {
+    /// The list with nothing on it.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// The list a card's `voiding` string list names, ignoring keys it does not know (a jar
+    /// card may carry any string).
+    #[must_use]
+    pub fn from_names<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        names
+            .into_iter()
+            .fold(Self::empty(), |void, name| void.with(name.as_ref()))
+    }
+
+    /// The bit a material key names.
+    fn bit(material: &str) -> Option<u8> {
+        VOID_MATERIALS
+            .iter()
+            .position(|known| known.eq_ignore_ascii_case(material.trim()))
+            .and_then(|index| u8::try_from(index).ok())
+            .map(|index| 1 << index)
+    }
+
+    /// Whether the card voided this material.
+    #[must_use]
+    pub fn contains(self, material: &str) -> bool {
+        Self::bit(material).is_some_and(|bit| self.0 & bit != 0)
+    }
+
+    /// This list plus `material`; an unknown key changes nothing.
+    #[must_use]
+    pub fn with(self, material: &str) -> Self {
+        Self(self.0 | Self::bit(material).unwrap_or(0))
+    }
+
+    /// This list without `material`.
+    #[must_use]
+    pub fn without(self, material: &str) -> Self {
+        Self(self.0 & !Self::bit(material).unwrap_or(0))
+    }
+
+    /// Whether the card voids nothing at all.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The materials, in the jar's own order.
+    pub fn iter(self) -> impl Iterator<Item = &'static str> {
+        VOID_MATERIALS
+            .iter()
+            .enumerate()
+            .filter(move |(index, _)| {
+                u8::try_from(*index).is_ok_and(|index| self.0 & (1 << index) != 0)
+            })
+            .map(|(_, material)| *material)
+    }
+
+    /// The materials, in the jar's own order, as the readout and the component write them.
+    #[must_use]
+    pub fn names(self) -> String {
+        self.iter().collect::<Vec<_>>().join(", ")
+    }
+}
+
+/// What a quarry card does at one cell: the jar's `commonQuarryBlock` decision tree, in its
+/// own order. It says *what* to do, not how — rolling the drops, filling the container and
+/// writing the block are the glue's.
+#[must_use]
+pub fn quarry_step(quarry: Quarry, facts: CellFacts) -> QuarryStep {
+    if facts.near_builder {
+        return QuarryStep::Skip(SkipReason::NearBuilder);
+    }
+    if facts.air {
+        return QuarryStep::Skip(SkipReason::Empty);
+    }
+    if facts.destroy_speed < 0.0 {
+        return QuarryStep::Skip(SkipReason::Unbreakable);
+    }
+    if !quarry.clearing && facts.is_replacement {
+        return QuarryStep::Skip(SkipReason::Replacement);
+    }
+    if facts.voided {
+        return QuarryStep::Void;
+    }
+    QuarryStep::Harvest
 }
 
 impl Shape {
@@ -871,6 +1240,10 @@ impl RefusalReason {
             RefusalReason::NoMaterial => "no block to place (put one above or below the builder)",
             RefusalReason::OutOfWorld => "outside the world's build height",
             RefusalReason::Protected => "protected (outside the world border)",
+            RefusalReason::NoRoom => {
+                "no room for the drops (put a container above or below the builder)"
+            }
+            RefusalReason::Unloaded => "the chunk is not loaded",
         }
     }
 }
@@ -930,27 +1303,62 @@ pub fn status_line(status: &Status) -> String {
     } else {
         String::new()
     };
+    // What the card is: a shape card builds, a quarry card breaks. The words are the jar's
+    // own `hudLogEntry` plus its `(clearing)` line.
+    let kind = match card.kind {
+        CardKind::Shape => String::new(),
+        CardKind::Quarry(quarry) => format!(
+            ", quarry ({}{})",
+            quarry.description(),
+            if quarry.clearing { ", clearing" } else { "" }
+        ),
+    };
+    let replace = match card.kind {
+        CardKind::Quarry(quarry) if !quarry.clearing => {
+            format!(", replacing with {}", status.replace)
+        }
+        _ => String::new(),
+    };
+    let voids = if card.voiding.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", voiding {}{}",
+            card.voiding.names(),
+            if card.tag_matching { " (tags too)" } else { "" }
+        )
+    };
     let head = format!(
-        "Builder at {x} {y} {z}: {} ({}) {dx}x{dy}x{dz} offset {ox} {oy} {oz}, {cells} cells{cap}",
+        "Builder at {x} {y} {z}: {} ({}) {dx}x{dy}x{dz} offset {ox} {oy} {oz}, {cells} cells{cap}{kind}{replace}{voids}",
         card.shape.description(),
         card.solid_word()
     );
+    let quarry = matches!(card.kind, CardKind::Quarry(_));
+    let action = if quarry { "quarried" } else { "placed" };
+    let voided = if status.progress.voided == 0 {
+        String::new()
+    } else {
+        format!(", {} voided", status.progress.voided)
+    };
     if let Some(refusal) = status.refusal {
         let [rx, ry, rz] = refusal.at;
         return format!(
-            "{head}, {} placed, refused at {rx} {ry} {rz}: {}",
+            "{head}, {} {action}{voided}, refused at {rx} {ry} {rz}: {}",
             status.progress.placed,
             refusal.reason.text()
         );
     }
     if status.complete {
-        return format!("{head}, {} placed, scan complete", status.progress.placed);
+        return format!(
+            "{head}, {} {action}{voided}, scan complete",
+            status.progress.placed
+        );
     }
-    if status.progress.placed == 0 && status.progress.skipped == 0 {
+    if status.progress.placed == 0 && status.progress.skipped == 0 && status.progress.voided == 0 {
         return format!("{head}, not started");
     }
     format!(
-        "{head}, {} placed, {} skipped",
+        "{head}, {} {action}{voided}, {} skipped",
         status.progress.placed, status.progress.skipped
     )
 }
@@ -969,6 +1377,9 @@ mod tests {
             dimension: dim,
             offset: [0, 0, 0],
             modifier: Modifier::default(),
+            kind: CardKind::Shape,
+            voiding: Voiding::empty(),
+            tag_matching: false,
         }
     }
 
@@ -1438,6 +1849,7 @@ mod tests {
                 refusal: None,
                 complete: false,
                 cells: None,
+                replace: String::new(),
             }),
             "Builder at 10 64 10: no shape card"
         );
@@ -1454,6 +1866,7 @@ mod tests {
                 refusal: None,
                 complete: false,
                 cells: None,
+                replace: String::new(),
             }),
             "Builder at 10 64 10: Sphere (Solid) 5x5x5 offset 0 0 0, 81 cells, not started"
         );
@@ -1464,11 +1877,13 @@ mod tests {
                 refused_card: None,
                 progress: Progress {
                     placed: 12,
-                    skipped: 40
+                    skipped: 40,
+                    voided: 0,
                 },
                 refusal: None,
                 complete: false,
                 cells: None,
+                replace: String::new(),
             }),
             "Builder at 10 64 10: Sphere (Solid) 5x5x5 offset 0 0 0, 81 cells, 12 placed, 40 skipped"
         );
@@ -1479,11 +1894,13 @@ mod tests {
                 refused_card: None,
                 progress: Progress {
                     placed: 81,
-                    skipped: 0
+                    skipped: 0,
+                    voided: 0,
                 },
                 refusal: None,
                 complete: true,
                 cells: None,
+                replace: String::new(),
             }),
             "Builder at 10 64 10: Sphere (Solid) 5x5x5 offset 0 0 0, 81 cells, 81 placed, scan complete"
         );
@@ -1494,7 +1911,8 @@ mod tests {
                 refused_card: None,
                 progress: Progress {
                     placed: 12,
-                    skipped: 3
+                    skipped: 3,
+                    voided: 0,
                 },
                 refusal: Some(Refusal {
                     at: [10, 68, 10],
@@ -1502,6 +1920,7 @@ mod tests {
                 }),
                 complete: false,
                 cells: None,
+                replace: String::new(),
             }),
             "Builder at 10 64 10: Sphere (Solid) 5x5x5 offset 0 0 0, 81 cells, 12 placed, \
              refused at 10 68 10: no block to place (put one above or below the builder)"
@@ -1518,6 +1937,7 @@ mod tests {
                 refusal: None,
                 complete: false,
                 cells: None,
+                replace: String::new(),
             }),
             "Builder at 10 64 10: card refused, shape of 134217728 cells past the 50000000-cell card limit"
         );
@@ -1571,6 +1991,7 @@ mod tests {
                 refusal: None,
                 complete: false,
                 cells: Some(CellCount { cells, more }),
+                replace: String::new(),
             })
         };
         assert_eq!(
@@ -1621,9 +2042,378 @@ mod tests {
                 refusal: None,
                 complete: false,
                 cells: None,
+                replace: String::new(),
             }),
             "Builder at 0 64 0: Box (Solid) 300x300x300 offset 0 0 0, 2097152 cells \
              (first 2097152 cells), not started"
         );
+    }
+
+    // --- the quarry card type ----------------------------------------------
+
+    /// The six `ShapeCardType.CARD_QUARRY*` constants and their four fields.
+    const QUARRY_TYPES: [(&str, Quarry); 6] = [
+        (
+            "quarry",
+            Quarry {
+                silk: false,
+                fortune: false,
+                clearing: false,
+            },
+        ),
+        (
+            "quarry_silk",
+            Quarry {
+                silk: true,
+                fortune: false,
+                clearing: false,
+            },
+        ),
+        (
+            "quarry_fortune",
+            Quarry {
+                silk: false,
+                fortune: true,
+                clearing: false,
+            },
+        ),
+        (
+            "quarry_clear",
+            Quarry {
+                silk: false,
+                fortune: false,
+                clearing: true,
+            },
+        ),
+        (
+            "quarry_clear_silk",
+            Quarry {
+                silk: true,
+                fortune: false,
+                clearing: true,
+            },
+        ),
+        (
+            "quarry_clear_fortune",
+            Quarry {
+                silk: false,
+                fortune: true,
+                clearing: true,
+            },
+        ),
+    ];
+
+    #[test]
+    fn the_quarry_card_types_are_the_jars_six_constants() {
+        assert_eq!(QUARRY_TYPES.len(), 6);
+        for (suffix, quarry) in QUARRY_TYPES {
+            assert_eq!(quarry.suffix(), suffix, "{quarry:?} writes its suffix");
+            assert_eq!(Quarry::parse(suffix), Some(quarry), "{suffix} reads back");
+            assert_eq!(
+                CardKind::parse(suffix),
+                Some(CardKind::Quarry(quarry)),
+                "{suffix} is a card type"
+            );
+            assert_eq!(CardKind::Quarry(quarry).suffix(), suffix);
+        }
+        assert_eq!(
+            Quarry::parse("shape_card_quarry_silk"),
+            Some(QUARRY_TYPES[1].1),
+            "the jar's item id reads too"
+        );
+        assert_eq!(Quarry::parse("quarry_nonsense"), None);
+        // The words the hudd log prints (`hudLogEntry`), and the clearing line.
+        assert_eq!(QUARRY_TYPES[0].1.description(), "Normal quarry");
+        assert_eq!(QUARRY_TYPES[1].1.description(), "Silktouch quarry");
+        assert_eq!(QUARRY_TYPES[2].1.description(), "Fortune quarry");
+        assert_eq!(QUARRY_TYPES[3].1.description(), "Normal quarry");
+        // A quarry is a card TYPE, not a shape: the jar has no quarry shape.
+        assert_eq!(Shape::parse("quarry"), None);
+        assert_eq!(CardKind::parse("shape"), Some(CardKind::Shape));
+        assert_eq!(CardKind::Shape.suffix(), "shape");
+        assert_eq!(CardKind::default(), CardKind::Shape);
+        assert_eq!(Card::default().kind, CardKind::Shape, "a bare card builds");
+    }
+
+    #[test]
+    fn a_quarry_leaves_what_it_must_not_break() {
+        let normal = QUARRY_TYPES[0].1;
+        let clear = QUARRY_TYPES[3].1;
+        let facts = |near_builder, air, destroy_speed, is_replacement, voided| CellFacts {
+            near_builder,
+            air,
+            destroy_speed,
+            is_replacement,
+            voided,
+        };
+        // The jar's order: the Builder's own 3x3x3, then air, then an unbreakable block,
+        // then the replacement block (a non-clearing card only), then the void list.
+        assert_eq!(
+            quarry_step(normal, facts(true, false, 2.0, false, false)),
+            QuarryStep::Skip(SkipReason::NearBuilder)
+        );
+        assert_eq!(
+            quarry_step(normal, facts(false, true, 0.0, false, false)),
+            QuarryStep::Skip(SkipReason::Empty)
+        );
+        assert_eq!(
+            quarry_step(normal, facts(false, false, -1.0, false, true)),
+            QuarryStep::Skip(SkipReason::Unbreakable),
+            "a block that cannot be destroyed is skipped even when it is on the void list"
+        );
+        assert_eq!(
+            quarry_step(normal, facts(false, false, 2.0, true, false)),
+            QuarryStep::Skip(SkipReason::Replacement),
+            "the quarry does not re-quarry its own replacement"
+        );
+        assert_eq!(
+            quarry_step(clear, facts(false, false, 2.0, true, false)),
+            QuarryStep::Harvest,
+            "a clearing card takes the replacement block too"
+        );
+        assert_eq!(
+            quarry_step(normal, facts(false, false, 2.0, false, true)),
+            QuarryStep::Void
+        );
+        assert_eq!(
+            quarry_step(clear, facts(false, false, 2.0, false, true)),
+            QuarryStep::Void
+        );
+        assert_eq!(
+            quarry_step(normal, facts(false, false, 0.6, false, false)),
+            QuarryStep::Harvest
+        );
+        // Silk and fortune change the drops, never the decision.
+        for (_, quarry) in QUARRY_TYPES {
+            assert_eq!(
+                quarry_step(quarry, facts(false, false, 1.5, false, false)),
+                QuarryStep::Harvest,
+                "{quarry:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_void_list_is_the_jars_materials_and_their_tags() {
+        // `ShapeCardItem.getVoidedBlocks`: exact blocks per material, and the tag each
+        // material expands to when the card's tag matching is on.
+        let material = |id: &str| material_of(id);
+        assert_eq!(material("minecraft:stone"), Some("stone"));
+        assert_eq!(material("minecraft:cobblestone"), Some("cobble"));
+        assert_eq!(material("minecraft:dirt"), Some("dirt"));
+        assert_eq!(
+            material("minecraft:grass_block"),
+            Some("dirt"),
+            "dirt's material covers grass too"
+        );
+        assert_eq!(material("minecraft:sand"), Some("sand"));
+        assert_eq!(material("minecraft:gravel"), Some("gravel"));
+        assert_eq!(material("minecraft:netherrack"), Some("netherrack"));
+        assert_eq!(material("minecraft:end_stone"), Some("endstone"));
+        assert_eq!(material("minecraft:andesite"), None, "not a material key");
+        assert_eq!(
+            material("minecraft:coarse_dirt"),
+            None,
+            "a tag member, not an id"
+        );
+        assert_eq!(tag_of("stone"), "c:stones");
+        assert_eq!(tag_of("cobble"), "c:cobblestones");
+        assert_eq!(tag_of("dirt"), "minecraft:dirt");
+        assert_eq!(tag_of("sand"), "c:sands");
+        assert_eq!(tag_of("gravel"), "c:gravels");
+        assert_eq!(tag_of("netherrack"), "c:netherracks");
+        assert_eq!(tag_of("endstone"), "c:end_stones");
+        assert_eq!(VOID_MATERIALS.len(), 7);
+
+        let void = Voiding::empty();
+        assert!(void.is_empty());
+        assert_eq!(void.names(), "");
+        let void = void.with("gravel").with("stone").with("nonsense");
+        assert!(
+            !void.is_empty(),
+            "an unknown key is ignored, a known one is kept"
+        );
+        assert!(void.contains("stone") && void.contains("gravel"));
+        assert!(!void.contains("dirt"));
+        assert_eq!(
+            void.names(),
+            "stone, gravel",
+            "the jar's own material order, not the insertion order"
+        );
+        assert_eq!(void.without("stone").names(), "gravel");
+        assert_eq!(Voiding::from_names(["dirt", "sand"]).names(), "dirt, sand");
+        assert_eq!(
+            Voiding::from_names(["nonsense", "dirt"]).names(),
+            "dirt",
+            "a jar card's unknown key reads as nothing"
+        );
+    }
+
+    /// A quarry card of `quarry` over a 3x3x3 box at offset 6, as the in-game rig has it.
+    fn quarry_card(quarry: Quarry) -> Card {
+        Card {
+            kind: CardKind::Quarry(quarry),
+            dimension: [3, 3, 3],
+            offset: [6, 0, 0],
+            ..Card::default()
+        }
+    }
+
+    #[test]
+    fn a_quarry_readout_names_its_type_replacement_and_void_list() {
+        let at = [10, 64, 10];
+        let quarry = Card {
+            voiding: Voiding::empty().with("dirt").with("gravel"),
+            tag_matching: true,
+            ..quarry_card(QUARRY_TYPES[0].1)
+        };
+        let line = |status: Status| status_line(&status);
+        assert_eq!(
+            line(Status {
+                at,
+                card: Some(quarry),
+                refused_card: None,
+                progress: Progress::default(),
+                refusal: None,
+                complete: false,
+                cells: None,
+                replace: "minecraft:dirt".to_owned(),
+            }),
+            "Builder at 10 64 10: Box (Solid) 3x3x3 offset 6 0 0, 27 cells, \
+             quarry (Normal quarry), replacing with minecraft:dirt, voiding dirt, gravel \
+             (tags too), not started"
+        );
+        assert_eq!(
+            line(Status {
+                at,
+                card: Some(quarry),
+                refused_card: None,
+                progress: Progress {
+                    placed: 25,
+                    skipped: 0,
+                    voided: 2,
+                },
+                refusal: None,
+                complete: true,
+                cells: Some(CellCount {
+                    cells: 27,
+                    more: false
+                }),
+                replace: "minecraft:dirt".to_owned(),
+            }),
+            "Builder at 10 64 10: Box (Solid) 3x3x3 offset 6 0 0, 27 cells, \
+             quarry (Normal quarry), replacing with minecraft:dirt, voiding dirt, gravel \
+             (tags too), 25 quarried, 2 voided, scan complete"
+        );
+        // A clearing card replaces nothing, so the readout does not claim it does; the
+        // clearing flag is the jar's own line beside the hud text.
+        assert_eq!(
+            line(Status {
+                at,
+                card: Some(quarry_card(QUARRY_TYPES[3].1)),
+                refused_card: None,
+                progress: Progress {
+                    placed: 27,
+                    skipped: 0,
+                    voided: 0,
+                },
+                refusal: None,
+                complete: true,
+                cells: None,
+                replace: "minecraft:cobblestone".to_owned(),
+            }),
+            "Builder at 10 64 10: Box (Solid) 3x3x3 offset 6 0 0, 27 cells, \
+             quarry (Normal quarry, clearing), 27 quarried, scan complete"
+        );
+        // A shape card is untouched by any of this.
+        assert_eq!(
+            line(Status {
+                at,
+                card: Some(card(Shape::Box, true, [3, 3, 3])),
+                refused_card: None,
+                progress: Progress::default(),
+                refusal: None,
+                complete: false,
+                cells: None,
+                replace: "minecraft:cobblestone".to_owned(),
+            }),
+            "Builder at 10 64 10: Box (Solid) 3x3x3 offset 0 0 0, 27 cells, not started"
+        );
+        // A quarry waiting at a cell names it, with the quarry words.
+        assert_eq!(
+            line(Status {
+                at,
+                card: Some(quarry_card(QUARRY_TYPES[1].1)),
+                refused_card: None,
+                progress: Progress {
+                    placed: 3,
+                    skipped: 0,
+                    voided: 0,
+                },
+                refusal: Some(Refusal {
+                    at: [17, 64, 10],
+                    reason: RefusalReason::NoRoom,
+                }),
+                complete: false,
+                cells: None,
+                replace: "minecraft:dirt".to_owned(),
+            }),
+            "Builder at 10 64 10: Box (Solid) 3x3x3 offset 6 0 0, 27 cells, \
+             quarry (Silktouch quarry), replacing with minecraft:dirt, 3 quarried, \
+             refused at 17 64 10: no room for the drops (put a container above or below the builder)"
+        );
+    }
+
+    #[test]
+    fn the_readout_counts_what_a_pass_acted_on() {
+        // The 8-a-tick budget is the jar's `quarryBaseSpeed`, and the walk is the same one
+        // the shape path uses; a quarry pass over a full 3x3x3 box acts on 27 cells.
+        let card = Card {
+            voiding: Voiding::empty().with("gravel"),
+            ..quarry_card(QUARRY_TYPES[0].1)
+        };
+        let mut occupied: std::collections::BTreeSet<[i32; 3]> = std::collections::BTreeSet::new();
+        let at = [0, 0, 0];
+        let mut scan = Scan::start(at, card);
+        let mut acted = 0;
+        let mut ticks = 0;
+        loop {
+            ticks += 1;
+            let mut this_tick = 0;
+            while this_tick < BLOCKS_PER_TICK {
+                let Some(cursor) = scan.cursor else { break };
+                assert!(card.contains(at, cursor), "{cursor:?} is not in the box");
+                // Every cell of this volume is stone but one, which is on the void list.
+                let voided = cursor == [7, 0, 0];
+                if !occupied.contains(&cursor) {
+                    occupied.insert(cursor);
+                    acted += 1;
+                    this_tick += 1;
+                    let _ = voided;
+                }
+                if !scan.advance() {
+                    assert_eq!(acted, 27);
+                    assert!(
+                        ticks <= 4,
+                        "27 cells at 8 a tick take 4 ticks, took {ticks}"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_air_blocks_are_the_jars_is_air() {
+        assert!(is_air_block("minecraft:air"));
+        assert!(is_air_block("minecraft:cave_air"));
+        assert!(is_air_block("minecraft:void_air"));
+        assert!(!is_air_block("minecraft:stone"));
+        assert!(!is_air_block("minecraft:short_grass"));
+        assert_eq!(QUARRY_REPLACE, "minecraft:dirt");
+        assert_eq!(QUARRY_TOOL, "minecraft:netherite_pickaxe");
+        assert_eq!(FORTUNE_LEVEL, 3);
+        assert_eq!(DONT_REMOVE_ME, "rftoolsbuilder:dontremoveme");
+        assert_eq!(BUILDER_CELLS, 1);
     }
 }

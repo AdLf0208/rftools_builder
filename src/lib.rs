@@ -1,22 +1,26 @@
-//! RFTools Builder for Horizon — the Builder block and its shape cards (slice 1).
+//! RFTools Builder for Horizon — the Builder block, its shape cards and the quarry
+//! card type.
 //!
-//! A **shape card** (`rftoolsbuilder:shape_card_def`) carries a shape, a size,
-//! an offset and whether the shape is solid or hollow, in the
+//! A **shape card** (`rftoolsbuilder:shape_card_def`) carries a card type, a shape,
+//! a size, an offset and whether the shape is solid or hollow, in the
 //! `rftoolsbuilder:shape_card` item component. A **Builder**
-//! (`rftoolsbuilder:builder`) with a card in its card slot walks that shape from
-//! the top down and places a block into every cell that can take one, taking the
-//! block from a container directly above it (or, failing that, below), at the
-//! jar's eight cells a tick.
+//! (`rftoolsbuilder:builder`) with a card in its card slot walks the card's box from
+//! the top down at the jar's eight cells a tick: a shape card places a block into
+//! every cell that can take one, taking it from a container directly above (or,
+//! failing that, below); a **quarry card** breaks the block in each cell, collects
+//! its drops there and leaves the Builder's replacement block behind, or air for a
+//! clearing card, while the card's void list removes blocks without collecting them.
 //!
 //! The card is authored either in the world — sneak-right-click a Builder with
 //! it, then click two corners, as upstream's `ShapeCardItem.useOn` does — or by
-//! `/rftoolsbuilder shape` for a shape the corners cannot express.
-//! `/rftoolsbuilder status` reads a Builder's shape, parameters and progress.
+//! `/rftoolsbuilder shape|offset|type|void|tagmatching|replace` for what the corners
+//! cannot express. `/rftoolsbuilder status` reads a Builder's card, replacement and
+//! progress.
 //!
-//! [`runtime`] is the pure geometry (the jar's nine shape formulas, the solid
-//! and hollow cells, the clamps and the walk) and [`support`] is the game glue.
-//! See `notes.md` for the slice boundary, the deliberate deviations and the
-//! gaps.
+//! [`runtime`] is the pure geometry and the quarry rule (the jar's ten shape
+//! formulas, the solid and hollow cells, the clamps, the walk, the card type's
+//! decision and the readout text) and [`support`] is the game glue. See `notes.md`
+//! for the slice boundary, the deliberate deviations and the gaps.
 pub mod runtime;
 mod support;
 

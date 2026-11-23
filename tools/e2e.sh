@@ -28,8 +28,15 @@
 #       and is dropped, so no craft can see it);
 #   11. a box outside the world border builds 0 cells and the chest keeps every
 #       block (the protected-cell rule);
-#   12. the Builder's loot table drops it when broken with an iron pickaxe;
-#   13. `/rftoolsbuilder reset` returns the held card to the jar's default solid
+#   12. the QUARRY card type: a card set to `quarry` over a 3x3x3 volume of 25 stone,
+#       one gravel and one coarse dirt breaks it and leaves `minecraft:dirt` behind,
+#       collecting 25 cobblestone and neither of the two voided blocks (`gravel` by
+#       id, `coarse_dirt` through the `minecraft:dirt` block tag); the card keeps its
+#       type and void list when it is taken out and put back; with tag matching off
+#       the coarse dirt is collected again; `/rftoolsbuilder replace` changes what the
+#       quarry leaves behind; and a box card on the same rig collects nothing;
+#   13. the Builder's loot table drops it when broken with an iron pickaxe;
+#   14. `/rftoolsbuilder reset` returns the held card to the jar's default solid
 #       5x5x5 box, read back with `status` as 125 cells.
 #
 # COUNTERFACTUAL=1 puts a vanilla furnace where the Builder goes: the card's
@@ -39,6 +46,8 @@
 #
 # SELFTEST=1 keeps the scenario and asserts 26 SOLID cells for the 3×3×3 box
 # (the box has 27), so the run MUST end in `FAIL:`: the count is not vacuous.
+# SELFTEST=quarry flips the quarry's replacement assertion (it expects cobblestone
+# where the pass writes dirt), so that run MUST end in `FAIL:` too.
 #
 # The mod is one flat `.hmod` the launcher compiles into the game, so GAME must
 # name a game the launcher built with it. The Builder's recipe needs
@@ -121,7 +130,7 @@ answer() {
     local i out=""
     for i in 1 2 3 4 5; do
         mod "$@"
-        out=$(ctl messages 20 | jq -r '.chat[]' | grep -E '^(Card set to|Card offset set to|Card reset|Hold a shape card|Unknown|usage:|the last argument|not a builder)' | head -1 || true)
+        out=$(ctl messages 20 | jq -r '.chat[]' | grep -E '^(Card set to|Card offset set to|Card type set to|Card voids|Card void list cleared|Card tag matching|Builder replacement set to|Card reset|Hold a shape card|Unknown|unknown card type|unknown material|usage:|the last argument|not a builder)' | head -1 || true)
         if [ -n "$out" ]; then
             echo "$out"
             return 0
@@ -130,25 +139,6 @@ answer() {
     done
     echo "$out"
 }
-# Put `item` in the main hand and prove it is there: `ctl select <item>` can land on a slot the
-# click does not read, and a click with the wrong stack silently does nothing.
-select_item() {
-    ctl select "$1" >/dev/null 2>&1 || true
-    ctl wait 4 >/dev/null
-    local held
-    held=$(ctl inventory | jq -r '.selected.item // .held.item // ""')
-    if [ "$held" = "$1" ]; then
-        return 0
-    fi
-    local slot
-    slot=$(ctl inventory | jq -r --arg i "$1" '(.hotbar // []) | to_entries[] | select((.value.item // "") == $i) | (.key + 1)' | head -1)
-    [ -n "$slot" ] || return 1
-    ctl select "$slot" >/dev/null || return 1
-    ctl wait 4 >/dev/null
-    held=$(ctl inventory | jq -r '.selected.item // .held.item // ""')
-    [ "$held" = "$1" ]
-}
-
 # Stand south of the Builder with a clear line to it: a finished pass has built stone in every cell
 # around it, so the two layers the click looks through are cleared and the player is put outside the
 # box (a Builder inside its own wall is only reachable through its GUI, which this slice has not).
@@ -202,7 +192,7 @@ new_builder() { # new_builder X Y Z SHAPE ARGS…
 
 # A click: the assertions after each one read the result, so a click the game reports as a failed
 # interaction is not fatal here (the readout, the slot and the volume decide).
-use() { ctl interact "$1" "$2" "$3" "$4" >/dev/null 2>&1 || true; ctl wait 6 >/dev/null; }
+use() { ctl interact "$1" "$2" "$3" "$4" 2>&1 | head -2 >&2 || true; ctl wait 6 >/dev/null; }
 # Sneak-right-click with an empty hand: takes the installed card back out.
 take_out() {
     ctl command "clear @s" >/dev/null
@@ -509,8 +499,282 @@ echo "status: $guarded_line; chest $guarded -> $guarded_after"
 echo "$guarded_line" | grep -q "27 cells, 0 placed" || fail "the guarded box was not held at 0 placed: $guarded_line"
 [ "$guarded" -eq "$guarded_after" ] || fail "the guarded pass took $((guarded - guarded_after)) blocks"
 ctl command "worldborder center 0 0" >/dev/null
-ctl command "worldborder set 60000000" >/dev/null
+ctl command "worldborder set 29999984" >/dev/null   # vanilla's maximum size; a larger one is refused
 ctl wait 10
+
+# --- the quarry card type --------------------------------------------------
+# A second rig: a Builder whose card is a QUARRY, not a shape. The card's own dimension and
+# offset put a 3x3x3 volume six blocks east of it (the Builder's own 3x3x3 is never quarried,
+# so the chest above it is safe), the volume holds 25 stone, one gravel and one coarse dirt,
+# and the card voids `gravel` by id and `dirt` through its block tag.
+QY=102
+QX=$X
+QZ=$((Z1 - 8))
+VX1=$((QX + 5)); VX2=$((QX + 7))
+VZ1=$((QZ - 1)); VZ2=$((QZ + 1))
+VY1=$((QY - 1)); VY2=$((QY + 1))
+
+# The amount of `item` in the container at a position.
+chest_total() { ctl container "$1" "$2" "$3" | jq -r '[.slots[]? | .count] | add // 0'; }
+# Every cell of the volume, as "x y z name" lines.
+volume_cells() {
+    local x y z
+    for ((x = VX1; x <= VX2; x++)); do
+        for ((y = VY1; y <= VY2; y++)); do
+            for ((z = VZ1; z <= VZ2; z++)); do
+                echo "$x $y $z $(block_name "$x" "$y" "$z")"
+            done
+        done
+    done
+}
+# Whether every cell of the volume is `material`.
+volume_all() {
+    local wrong
+    wrong=$(volume_cells | awk -v want="$1" '$4 != want' | head -3)
+    [ -z "$wrong" ] || { echo "$wrong" >&2; return 1; }
+}
+# Fills the volume: `stone` cells plus the one gravel and one coarse dirt.
+fill_volume() { # [gravel] [coarse_dirt]
+    local gravel=${1:-1} coarse=${2:-1}
+    ctl command "fill $VX1 $VY1 $VZ1 $VX2 $VY2 $VZ2 minecraft:stone" >/dev/null
+    [ "$gravel" = 1 ] && ctl setblock "$VX2" "$VY2" "$VZ2" minecraft:gravel >/dev/null
+    [ "$coarse" = 1 ] && ctl setblock "$VX1" "$VY1" "$VZ1" minecraft:coarse_dirt >/dev/null
+    ctl wait 6 >/dev/null
+}
+# A fresh quarry rig: the site cleared, a Builder placed, a chest above it.
+quarry_rig() {
+    # From the pedestal's own layer up: the arena floor under the player stays, so the click's
+    # reach and the place command's visible face are the same as the first rig's.
+    ctl command "fill $((QX - 4)) $((QY - 1)) $((QZ - 4)) $((VX2 + 2)) $((QY + 4)) $((VZ2 + 2)) minecraft:air" >/dev/null 2>&1 || true
+    ctl wait 6 >/dev/null
+    ctl setblock "$QX" $((QY - 1)) "$QZ" minecraft:stone >/dev/null
+    # The Builder is set in place, as the loot phase does: the item-placement path is the first
+    # rig's proof, and this rig's own subject is the card type.
+    ctl command "setblock $QX $QY $QZ $BUILDER" >/dev/null 2>&1 || true
+    ctl wait 6 >/dev/null
+    [ "$(block_name "$QX" "$QY" "$QZ")" = "$BUILDER" ] || fail "the quarry Builder is not at $QX $QY $QZ"
+    ctl tp "$QX.5" "$QY" "$((QZ + 3)).5" >/dev/null
+    ctl wait 8 >/dev/null
+    ctl setblock "$QX" $((QY + 1)) "$QZ" minecraft:chest >/dev/null
+    ctl command "clear @a" >/dev/null
+    ctl wait 6 >/dev/null
+    echo "quarry Builder: $(block_state "$QX" "$QY" "$QZ")" >&2
+    # The player stands south of the Builder, so the face to aim at and click is its south one
+    # (the block's own `facing` property is the machine's front and may point anywhere).
+    qface=south
+    ctl look-at block "$QX" "$QY" "$QZ" "$qface" >/dev/null 2>&1 || true
+    ctl wait 6 >/dev/null
+}
+# Writes the held card and installs it by a click on the quarry Builder.
+install_quarry_card() { # type tags(on|off) [material…]
+    local type=$1 tags=${2:-off}
+    shift 2
+    ctl command "clear @a" >/dev/null
+    ctl wait 4 >/dev/null
+    ctl give "$CARD" 1 >/dev/null || fail "cannot give a quarry card"
+    ctl wait 6 >/dev/null
+    ctl select "$CARD" >/dev/null || fail "cannot select the quarry card"
+    ctl wait 6 >/dev/null
+    local line
+    line=$(answer shape box 3 3 3)
+    echo "$line" | grep -q "Box (Solid) 3x3x3" || fail "the quarry card was not written: $line"
+    line=$(answer offset 6 0 0)
+    echo "$line" | grep -q "Card offset set to 6 0 0" || fail "the quarry card's offset: $line"
+    line=$(answer type "$type")
+    echo "$line" | grep -q "Card type set to $type" || fail "the card type was not written: $line"
+    local material
+    for material in "$@"; do
+        line=$(answer void "$material")
+        echo "$line" | grep -q "Card voids $material" || fail "the void list: $line"
+    done
+    line=$(answer tagmatching "$tags")
+    echo "$line" | grep -q "Card tag matching $tags" || fail "the tag toggle: $line"
+    install_held_card "Box (Solid) 3x3x3 offset 6 0 0"
+}
+# Installs the card the player already holds and reads the Builder back.
+install_held_card() { # expected readout fragment
+    ctl look-at block "$QX" "$QY" "$QZ" "$qface" >/dev/null 2>&1 || true
+    ctl wait 6 >/dev/null
+    use "$QX" "$QY" "$QZ" "$qface"
+    echo "click: bar '$(action_bar)'; cards held $(count_item "$CARD"); $(ctl state | jq -c '{pos: .player.position, held: (.held // .selected // null)}')" >&2
+    local line
+    line=$(status "$QX" "$QY" "$QZ")
+    echo "quarry card: $line"
+    echo "$line" | grep -q "$1" || fail "the card is not in the Builder: $line"
+}
+
+# Takes the card back out of the quarry Builder (sneak-click with an empty hand).
+take_quarry_card() {
+    ctl command "clear @a" >/dev/null
+    ctl wait 6 >/dev/null
+    ctl tp "$QX.5" "$QY" "$((QZ + 3)).5" >/dev/null
+    ctl wait 8 >/dev/null
+    ctl look-at block "$QX" "$QY" "$QZ" "$qface" >/dev/null 2>&1 || true
+    ctl key shift down >/dev/null 2>&1 || true
+    ctl wait 4 >/dev/null
+    use "$QX" "$QY" "$QZ" "$qface"
+    ctl key shift up >/dev/null 2>&1 || true
+    ctl wait 10 >/dev/null
+}
+
+say "QUARRY: a quarry card breaks the box beside the Builder and collects its drops"
+quarry_rig
+fill_volume 1 1
+install_quarry_card quarry on gravel dirt
+# The readout names the type, the replacement block and the void list before anything runs.
+line=$(status "$QX" "$QY" "$QZ")
+echo "quarry status: $line"
+echo "$line" | grep -q "27 cells, quarry (Normal quarry), replacing with minecraft:dirt, voiding dirt, gravel (tags too)" \
+    || fail "the quarry readout does not name its type, replacement and void list: $line"
+ctl wait 120 >/dev/null
+line=$(status "$QX" "$QY" "$QZ")
+echo "quarry status: $line"
+echo "$line" | grep -q "27 cells, quarry (Normal quarry), replacing with minecraft:dirt, voiding dirt, gravel (tags too), 27 quarried, 2 voided, scan complete" \
+    || fail "the quarry pass did not finish over 27 cells: $line"
+# The replacement assertion: what the pass left behind. SELFTEST=quarry flips it.
+q_expected=minecraft:dirt
+if [ "$SELFTEST" = quarry ]; then q_expected=minecraft:cobblestone; fi
+if ! volume_all "$q_expected"; then
+    fail "the quarry did not replace the 27 cells with $q_expected ($(volume_cells | awk -v want="$q_expected" '$4 != want' | wc -l) cells differ)"
+fi
+q_cobble=$(chest_count "$QX" $((QY + 1)) "$QZ" minecraft:cobblestone)
+q_gravel=$(chest_count "$QX" $((QY + 1)) "$QZ" minecraft:gravel)
+q_coarse=$(chest_count "$QX" $((QY + 1)) "$QZ" minecraft:coarse_dirt)
+q_total=$(chest_total "$QX" $((QY + 1)) "$QZ")
+echo "collected: $q_cobble cobblestone, $q_gravel gravel, $q_coarse coarse_dirt (total $q_total)"
+# 25 stone cells drop cobblestone; the gravel is voided by id and the coarse dirt through the
+# `minecraft:dirt` tag, so neither is collected — a quarry that ignored its void list would
+# hold 27 stacks here (flint or gravel for the gravel cell).
+[ "$q_cobble" -eq 25 ] || fail "the quarry collected $q_cobble cobblestone, expected 25"
+[ "$q_gravel" -eq 0 ] || fail "the void list's gravel was collected ($q_gravel)"
+[ "$q_coarse" -eq 0 ] || fail "tag matching did not void the coarse dirt ($q_coarse)"
+[ "$q_total" -eq 25 ] || fail "the chest holds $q_total items, expected 25"
+
+say "QUARRY: the card keeps its type and void list when it is taken out and put back"
+take_quarry_card
+cards=$(count_item "$CARD")
+echo "cards in the inventory: $cards"
+[ "$cards" -eq 1 ] || fail "the quarry card did not come back ($cards)"
+line=$(status "$QX" "$QY" "$QZ")
+echo "status after the take-out: $line"
+echo "$line" | grep -q "no shape card" || fail "the Builder still holds a card: $line"
+ctl select "$CARD" >/dev/null || fail "cannot hold the quarry card again"
+install_held_card "quarry (Normal quarry)"
+line=$(status "$QX" "$QY" "$QZ")
+echo "status after the put-back: $line"
+echo "$line" | grep -q "quarry (Normal quarry), replacing with minecraft:dirt, voiding dirt, gravel (tags too)" \
+    || fail "the card lost its quarry settings when it was moved: $line"
+# The second pass walks the same 27 cells, and every one of them is the replacement block: the
+# non-clearing quarry leaves them alone and collects nothing.
+echo "$line" | grep -q "27 cells, quarry (Normal quarry), replacing with minecraft:dirt, voiding dirt, gravel (tags too), 0 quarried, scan complete" \
+    || fail "a quarry over its own replacement block worked: $line"
+[ "$(chest_total "$QX" $((QY + 1)) "$QZ")" -eq 25 ] || fail "the second pass collected something"
+
+say "QUARRY: tag matching off collects the tag's blocks again"
+take_quarry_card
+ctl select "$CARD" >/dev/null || fail "cannot hold the quarry card"
+line=$(answer tagmatching off)
+echo "$line" | grep -q "Card tag matching off" || fail "the tag toggle: $line"
+fill_volume 1 1
+install_held_card "quarry (Normal quarry)"
+ctl wait 120 >/dev/null
+line=$(status "$QX" "$QY" "$QZ")
+echo "quarry status: $line"
+echo "$line" | grep -q "27 cells, quarry (Normal quarry), replacing with minecraft:dirt, voiding dirt, gravel, 27 quarried, 1 voided, scan complete" \
+    || fail "the second quarry pass: $line"
+q_cobble2=$(chest_count "$QX" $((QY + 1)) "$QZ" minecraft:cobblestone)
+q_gravel2=$(chest_count "$QX" $((QY + 1)) "$QZ" minecraft:gravel)
+q_coarse2=$(chest_count "$QX" $((QY + 1)) "$QZ" minecraft:coarse_dirt)
+echo "collected: $q_cobble2 cobblestone, $q_gravel2 gravel, $q_coarse2 coarse_dirt"
+[ "$q_cobble2" -eq 50 ] || fail "the second pass collected $q_cobble2 cobblestone, expected 50"
+[ "$q_gravel2" -eq 0 ] || fail "the void list's gravel was collected on the second pass"
+[ "$q_coarse2" -eq 1 ] || fail "with tag matching off the coarse dirt is not voided ($q_coarse2)"
+volume_all minecraft:dirt || fail "the second pass did not replace every cell"
+
+say "QUARRY: /rftoolsbuilder replace sets what a quarry leaves behind"
+take_quarry_card
+ctl select "$CARD" >/dev/null || fail "cannot hold the quarry card"
+line=$(answer replace "$QX" "$QY" "$QZ" minecraft:cobblestone)
+echo "replace: $line"
+echo "$line" | grep -q "Builder replacement set to minecraft:cobblestone" || fail "the replacement: $line"
+fill_volume 0 0
+install_held_card "replacing with minecraft:cobblestone"
+ctl wait 120 >/dev/null
+line=$(status "$QX" "$QY" "$QZ")
+echo "quarry status: $line"
+echo "$line" | grep -q "replacing with minecraft:cobblestone" || fail "the readout: $line"
+echo "$line" | grep -q "27 quarried, scan complete" || fail "the third quarry pass: $line"
+volume_all minecraft:cobblestone || fail "the quarry left $(volume_cells | awk '$4 != "minecraft:cobblestone"' | head -1) behind, not cobblestone"
+
+say "QUARRY: a clearing card leaves air, not the replacement block"
+fill_volume 0 0
+install_quarry_card quarry_clear off
+ctl wait 120 >/dev/null
+line=$(status "$QX" "$QY" "$QZ")
+clear_cobble=$(chest_count "$QX" $((QY + 1)) "$QZ" minecraft:cobblestone)
+echo "clearing status: $line; collected $clear_cobble cobblestone"
+echo "$line" | grep -q "quarry (Normal quarry, clearing), 27 quarried, scan complete" \
+    || fail "the clearing readout: $line"
+volume_all minecraft:air || fail "a clearing card left $(volume_cells | awk '$4 != "minecraft:air"' | head -1) behind"
+[ "$clear_cobble" -eq 104 ] || fail "the clearing pass collected $clear_cobble cobblestone, expected 104"
+
+say "QUARRY: a silk card collects the block itself, where the plain one collects its drop"
+fill_volume 0 0
+install_quarry_card quarry_silk off
+ctl wait 120 >/dev/null
+line=$(status "$QX" "$QY" "$QZ")
+silk_stone=$(chest_count "$QX" $((QY + 1)) "$QZ" minecraft:stone)
+silk_cobble=$(chest_count "$QX" $((QY + 1)) "$QZ" minecraft:cobblestone)
+echo "silk status: $line; collected $silk_stone stone and $silk_cobble cobblestone"
+echo "$line" | grep -q "quarry (Silktouch quarry), replacing with minecraft:cobblestone, 27 quarried, scan complete" \
+    || fail "the silk readout: $line"
+[ "$silk_stone" -eq 27 ] || fail "the silk quarry collected $silk_stone stone, expected 27"
+[ "$silk_cobble" -eq 104 ] || fail "the silk quarry collected cobblestone ($silk_cobble): it did not use silk touch"
+
+say "QUARRY: a fortune card turns gravel into flint (fortune III makes the table's roll certain)"
+fill_volume 1 0
+install_quarry_card quarry_fortune off
+ctl wait 120 >/dev/null
+line=$(status "$QX" "$QY" "$QZ")
+fortune_flint=$(chest_count "$QX" $((QY + 1)) "$QZ" minecraft:flint)
+fortune_gravel=$(chest_count "$QX" $((QY + 1)) "$QZ" minecraft:gravel)
+fortune_cobble=$(chest_count "$QX" $((QY + 1)) "$QZ" minecraft:cobblestone)
+echo "fortune status: $line; collected $fortune_flint flint, $fortune_gravel gravel, $fortune_cobble cobblestone"
+echo "$line" | grep -q "quarry (Fortune quarry), replacing with minecraft:cobblestone, 27 quarried, scan complete" \
+    || fail "the fortune readout: $line"
+[ "$fortune_flint" -eq 1 ] || fail "the fortune quarry collected $fortune_flint flint, expected 1"
+[ "$fortune_gravel" -eq 0 ] || fail "the fortune quarry left gravel instead of flint ($fortune_gravel)"
+[ "$fortune_cobble" -eq 130 ] || fail "the fortune pass collected $fortune_cobble cobblestone, expected 130"
+
+say "CONTROL: the same rig with a box card collects nothing"
+take_quarry_card
+ctl command "clear @a" >/dev/null
+# A full volume under the same card geometry (no cell a shape card can replace, so it places
+# nothing) and a chest that is not touched: a card that collected anything would move its total.
+ctl command "fill $VX1 $VY1 $VZ1 $VX2 $VY2 $VZ2 minecraft:cobblestone" >/dev/null
+ctl wait 6 >/dev/null
+control_before=$(chest_total "$QX" $((QY + 1)) "$QZ")
+echo "chest total before the control: $control_before"
+ctl give "$CARD" 1 >/dev/null || fail "cannot give the control card"
+ctl wait 6 >/dev/null
+ctl select "$CARD" >/dev/null || fail "cannot select the control card"
+ctl wait 6 >/dev/null
+line=$(answer shape box 3 3 3)
+echo "$line" | grep -q "Box (Solid) 3x3x3" || fail "the control card: $line"
+line=$(answer offset 6 0 0)
+echo "$line" | grep -q "Card offset set to 6 0 0" || fail "the control card's offset: $line"
+ctl tp "$QX.5" "$QY" "$((QZ + 3)).5" >/dev/null
+ctl wait 6 >/dev/null
+ctl look-at block "$QX" "$QY" "$QZ" "$qface" >/dev/null 2>&1 || true
+use "$QX" "$QY" "$QZ" "$qface"
+ctl wait 60 >/dev/null
+line=$(status "$QX" "$QY" "$QZ")
+bar=$(chest_total "$QX" $((QY + 1)) "$QZ")
+echo "control status: $line; chest total: $control_before -> $bar"
+echo "$line" | grep -q "Box (Solid) 3x3x3 offset 6 0 0, 27 cells, 0 placed" \
+    || fail "a box card did not stop at 0 placed: $line"
+[ "$bar" -eq "$control_before" ] || fail "the box card moved the chest to $bar items"
+volume_all minecraft:cobblestone || fail "the box card changed a cell of its volume"
 
 say "the Builder's loot table drops the Builder"
 # `ctl break` mines the way a player does: survival (creative's instant break is not on that path)
@@ -573,4 +837,4 @@ cards=$(count_item "$CARD")
 echo "cards in the inventory after reset: $cards"
 [ "$cards" -eq 1 ] || fail "the reset consumed the card ($cards left)"
 
-echo "PASS: both carried recipes craft in a real crafting table (the shape card from 4 paper, 2 bricks, 1 iron ingot and 2 redstone; the Builder from 4 bricks, an ender pearl, 3 redstone and a machine frame) with their ingredients consumed and their wrong-ingredient controls empty, the game log has no rejected ingredient, the Builder fills its 3x3x3 box from the chest above it (24 placed, 64 -> 40), a hollow 5x5x5 is a 98-cell shell (92 placed against a full chest), a box outside the world border builds 0 and spends nothing, the Builder's loot table drops it, the card goes in, comes back out, resets to the 5x5x5 default, and the placed volume survives a relaunch"
+echo "PASS: both carried recipes craft in a real crafting table (the shape card from 4 paper, 2 bricks, 1 iron ingot and 2 redstone; the Builder from 4 bricks, an ender pearl, 3 redstone and a machine frame) with their ingredients consumed and their wrong-ingredient controls empty, the game log has no rejected ingredient, the Builder fills its 3x3x3 box from the chest above it (24 placed, 64 -> 40), a hollow 5x5x5 is a 98-cell shell (92 placed against a full chest), a box outside the world border builds 0 and spends nothing, a quarry card over 27 cells breaks them and leaves the configured replacement (25 cobblestone collected, the gravel and the tag-matched coarse dirt voided and not collected), the quarry card keeps its type and void list when it is taken out and put back, tag matching off collects the coarse dirt again, /rftoolsbuilder replace changes the replacement, a box card on the same rig collects nothing, the Builder's loot table drops it, the card goes in, comes back out, resets to the 5x5x5 default, and the placed volume survives a relaunch"

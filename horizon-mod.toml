@@ -1,13 +1,16 @@
 id = "rftoolsbuilder"
 name = "RFTools Builder"
-version = "0.2.2"
+version = "0.2.3"
 description = """RFTools Builder for Horizon: the Builder block and its shape cards. A card carries a
-shape (box, sphere, cylinder, capped cylinder, prism, cone, top and bottom dome, torus, heart),
-its size, its offset and whether it is solid or hollow; the Builder walks that shape from the top
-and places a block into each replaceable cell, at the jar's eight cells a tick, taking the block
-from a container above or below it. /rftoolsbuilder status reads a Builder's shape and progress
-back. The quarry, movers, shields, space chamber, composer, projector and scanner are not
-carried."""
+shape (box, sphere, cylinder, capped cylinder, prism, cone, top and bottom dome, torus, heart) or
+one of the quarry card types (normal, silk touch, fortune, and their clearing variants), its size,
+its offset and whether the shape is solid or hollow; the Builder walks that shape from the top and
+either places a block into each replaceable cell or, for a quarry, breaks the block there, collects
+its drops into a container above or below it and leaves the replacement block behind (or air, when
+the card clears), at the jar's eight cells a tick. A quarry card's void list removes blocks without
+collecting them, and the Builder's replacement block is settable. /rftoolsbuilder status reads a
+Builder's card, replacement and progress back. The movers, shields, space chamber, composer,
+projector and scanner are not carried."""
 authors = ["McJty"]
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins,
 # beside data/ and assets/. The id is the resource namespace and the only identity: Cargo's

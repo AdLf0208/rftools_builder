@@ -1,8 +1,8 @@
 # RFTools Builder for Horizon
 
 A Horizon native mod (mod API 0.2) that ports **RFTools Builder 1.21-7.0.8**
-(McJtyMods/RFToolsBuilder, MIT): the **Builder** block and its **shape cards**,
-and the shape geometry behind them.
+(McJtyMods/RFToolsBuilder, MIT): the **Builder** block, its **shape cards** and the
+**quarry card type**, with the shape geometry behind them.
 
 ## What this slice does
 
@@ -23,17 +23,30 @@ and the shape geometry behind them.
   the container directly above it, or below if the one above has none, exactly as
   the jar's `createTakeableItem` does. With no block in reach it waits at that
   cell and says so.
-- **`/rftoolsbuilder status <pos>`** reads a Builder out: shape, size, offset,
-  cell count, progress, and the first cell it refused and why.
+- **The quarry card type**: `/rftoolsbuilder type quarry` (or `quarry_silk`,
+  `quarry_fortune`, `quarry_clear`, `quarry_clear_silk`, `quarry_clear_fortune`)
+  turns the same card into the jar's `ShapeCardType.CARD_QUARRY*` — it keeps the
+  card's box and **breaks** what is in it instead of building. The block's drops
+  (plain, silk touch or fortune III, the jar's `getHarvesterTool`) go into the
+  container above the Builder, else below; the Builder's replacement block (the
+  jar's `minecraft:dirt`, `/rftoolsbuilder replace <x> <y> <z> <block>`) is left
+  behind, or air for a clearing card.
+- **The void list**: `/rftoolsbuilder void <stone|cobble|dirt|sand|gravel|netherrack|endstone>`
+  removes those blocks without collecting them, and `/rftoolsbuilder tagmatching
+  on|off` extends each material to its block tag (`getVoidedBlocks`). The card's
+  type, void list and toggle are component fields, so they survive being moved.
+- **`/rftoolsbuilder status <pos>`** reads a Builder out: its card type, shape,
+  size, offset, cell count, the replacement block, the void list, progress, and
+  the first cell it refused and why.
 - The card goes into the Builder's card slot on a right click; an empty hand
   reads the Builder out; a sneaking empty hand takes the card back.
 
 ## What it does not do
 
-The quarry (its resource scan, silk/fortune drops and replacement), the movers
-and their controls, the shields, the space chamber, the composer, the projector,
-the scanner, the GUI screens and the liquid/pump cards are **not** carried. The
-`GAPS` list in `notes.md` names each with the upstream file that implements it.
+The movers and their controls, the shields, the space chamber, the composer, the
+projector, the scanner, the GUI screens, the liquid/pump cards, the void card, the
+filter module, energy and chunk loading are **not** carried. The `GAPS` list in
+`notes.md` names each with the upstream file that implements it.
 
 ## Building
 

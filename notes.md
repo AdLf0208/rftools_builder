@@ -26,19 +26,20 @@ One flat `.hmod` — `horizon-mod.toml` + `Cargo.toml` + `src/` + `assets/` +
 `compatibility.json` are retired with that container and are not recreated.
 
 Status: **ported-partial** — slice 1 (the Builder's shaped mode with its shape
-cards) and slice 2 (the carried recipes repaired to the 26.3 dialect and proven
-in game) are implemented, their 29 runtime tests and 9 glue tests (38 in all)
-are green, the SDK gate is green, and the package is **verified in a
-launcher-built game**: the modded leg passes, the unmodded control and the
-selftest both fail. The gap list below is the rest of the mod.
+cards), slice 2 (the carried recipes repaired to the 26.3 dialect and proven in
+game) and slice 3 (the quarry card type, its void list and the replacement block)
+are implemented, their 35 runtime tests and 10 glue tests (45 in all) are green, the
+SDK gate is green, and the package is **verified in a launcher-built game**: the
+modded leg passes every phase including the quarry's, the unmodded control and both
+selftest legs fail. The gap list below is the rest of the mod.
 
-Package at **0.2.2**: **56,154 B**, SHA-256
-`f09026b0f9f9cc91a2204f9231b07a595e62cda9f18e80ab46601ad049c5e872`, built twice
-byte-identically against SDK **`0a875da9…`** + mixins `e59da90…` (`check` exit 0,
-`fits` `made for` at the pin and `fits` at `0b14f8a`). The command → exact-output →
-log table for every number below is [`VALIDATION.md`](VALIDATION.md);
-the canonical logs are `sdk-test.log`, `sdk-fits.log`, `sdk-fits-other.log`, and the
-0.2.0 measurements are retired in `evidence/rftoolsbuilder/retired-0.2.0/`.
+Package at **0.2.3**: **69,798 B**, SHA-256
+`9efbb76f1a8092a217c81410ebc58f55b0e1a9691841f43d90183e0ee66da8b9`, built twice byte-identically against SDK **`0a875da9…`** + mixins
+`e59da90…` (`check` exit 0, `fits` `made for` at the pin and `fits` at `0b14f8a`).
+The command → exact-output → log table for every number below is
+[`VALIDATION.md`](VALIDATION.md); the canonical logs are `sdk-test.log`,
+`sdk-fits.log`, `sdk-fits-other.log`, and the 0.2.0 measurements are retired in
+`evidence/rftoolsbuilder/retired-0.2.0/`.
 
 ## Class + tier and the approach
 
@@ -143,13 +144,13 @@ files — the artefact wins, and the slice only carries two recipes anyway.)
 | Hook / Part | What it does |
 |---|---|
 | `register` → `Registrar` | declares the block-entity type `rftoolsbuilder:builder_block_entity` over the Builder, attaches its `BlockEntityPart`, declares the block's 1-slot container, attaches the card's `ItemPart` |
-| `component_types` | declares `rftoolsbuilder:shape_card`, the namespaced NBT component a card stack carries |
+| `component_types` | declares `rftoolsbuilder:shape_card`, the namespaced NBT component a card stack carries (shape, size, offset, turn, card type, void list, tag toggle) |
 | `BlockEntityPart::block_entity` | gives the Builder an empty saved compound |
 | `BlockEntityPart::block_entity_ticks` | `ticks = true` (`EntityBlock.getTicker`) |
-| `BlockEntityPart::block_entity_tick` | the walk and the placement, `Unchanged` when idle |
+| `BlockEntityPart::block_entity_tick` | the walk and the placement (a shape card) or the break-and-replace rule (a quarry card), `Unchanged` when idle |
 | `ItemPart::use_on` | the card's corner authoring |
 | `right_click_block` (cancel) | install the card / read out / take the card back |
-| `register_commands` + `run_mod_command` | `/rftoolsbuilder status|shape|offset|reset` |
+| `register_commands` + `run_mod_command` | `/rftoolsbuilder status|shape|offset|reset|type|void|tagmatching|replace` |
 
 ## Upstream source read
 
@@ -176,12 +177,16 @@ two-corner arithmetic; the material search above-then-below; the default card.
 Each line names where upstream implements it, so the next slice can start from
 the artefact:
 
-- **The quarry**: `ShapeCardType.CARD_QUARRY*` (`quarryBlock`,
+- ~~**The quarry**: `ShapeCardType.CARD_QUARRY*` (`quarryBlock`,
   `silkQuarryBlock`, `commonQuarryBlock`, `clearOrDirtBlock`), the void list
   (`getVoidedBlocks`), the replacement block (`getQuarryReplace`), chunk
   loading (`chunkLoad`/`chunkUnload`). The **quarry card is a card type, not a
   shape**: it has no geometry of its own — it uses the card's dimension and
-  replaces what it breaks. There is no "quarry shape" in the jar, so none is
+  replaces what it breaks.~~ **Carried in slice 3 (0.2.3)**, except the force-load
+  branch of `chunkLoad`/`chunkUnload`: the Builder keeps the jar's
+  `quarryChunkloads=false` behaviour (`is_loaded` → wait). That is a scope choice,
+  not a blocked gap — the pin *does* express the other branch
+  (`Registrar::register_ticket_controller` + `chunk.set_mod_forced`). There is no "quarry shape" in the jar, so none is
   invented here.
 - **No "frame" shape either**: the jar has solid and hollow only
   (`IFormula.correctFormula`); a `frame` would be a new shape, so it is not
@@ -525,7 +530,7 @@ EXIT:0
 | `/rftoolsbuilder status` | **tested** | six readouts asserted byte-exactly (`no shape card`, `27 cells, 24 placed`, `98 cells, 92 placed offset 0 2 0`, `27 cells, 0 placed`, `not a builder`, the reset default) |
 | `/rftoolsbuilder shape`, `offset`, `reset` | **tested** | `Card set to Box (Solid) 3x3x3`, `Card offset set to 0 2 0`, `Card reset to the jar's default: Box (Solid) 5x5x5 offset 0 0 0` |
 | the 3×3×3 / 5×5×5 cubes, the arena | — | scenario scaffolding, not a mod family |
-| the quarry, movers, shields, space chamber, composer/projector/scanner, GUI, liquid cards, filter module, energy, chunk loading, HUD | **not ported** | gaps 2–13 below: each names the upstream class it waits on |
+| the movers, shields, space chamber, composer/projector/scanner, GUI, liquid cards, filter module, energy, chunk loading, HUD | **not ported** | gaps 3–13 below: each names the upstream class it waits on (the quarry left this row in 0.2.3 — its own coverage table is in *Slice 3*) |
 
 ### Ladder (0.2.2)
 
@@ -549,6 +554,199 @@ need `cargo horizon-mod` (the remote runner has no such subcommand installed).
 | package gate | `python3 ports/tools/verify-sdk-package.py rftoolsbuilder` | **1/1** (`31 entries`, no packed `Cargo.lock`) | — |
 | in-game | the three legs above | `PASS` + `EXIT:0`, control `EXIT:1`, selftest `EXIT:1` | `../_shared/evidence/rftoolsbuilder-e2e/*.log` |
 
+## Slice 3 (0.2.3, 2026-11-23) — the quarry card type
+
+The gap line this slice answers, verbatim from *Slice boundary* above: *"**The quarry**:
+`ShapeCardType.CARD_QUARRY*` (`quarryBlock`, `silkQuarryBlock`, `commonQuarryBlock`,
+`clearOrDirtBlock`), the void list (`getVoidedBlocks`), the replacement block
+(`getQuarryReplace`), chunk loading (`chunkLoad`/`chunkUnload`). The **quarry card is a card
+type, not a shape**: it has no geometry of its own — it uses the card's dimension and replaces
+what it breaks."*
+
+It fits the `deep` tier as the tier's **machines-shaped** half already does: no new block
+entity, no menu, no renderer, no geometry. A quarry card is a **rule in the Builder's existing
+tick** plus a card type and its authoring — the same walk the shape cards use, with "break and
+replace" where they place.
+
+### What the jar says (branch `1.21_neo` @ `409049466`, `version=1.21-7.0.8`)
+
+`ShapeCardType.java` — the six quarry constants and the four fields this slice carries
+(`resourceSuffix`, `quarry`, `clearing`, `fortune`, plus the `SingleBlockHandler`):
+
+| constant | suffix | quarry | clearing | fortune | handler |
+|---|---|---|---|---|---|
+| `CARD_QUARRY` | `quarry` | true | false | false | `quarryBlock` → `commonQuarryBlock(false, …)` |
+| `CARD_QUARRY_SILK` | `quarry_silk` | true | false | false | `silkQuarryBlock` → `commonQuarryBlock(true, …)` |
+| `CARD_QUARRY_FORTUNE` | `quarry_fortune` | true | false | true | `quarryBlock` |
+| `CARD_QUARRY_CLEAR` | `quarry_clear` | true | true | false | `quarryBlock` |
+| `CARD_QUARRY_CLEAR_SILK` | `quarry_clear_silk` | true | true | false | `silkQuarryBlock` |
+| `CARD_QUARRY_CLEAR_FORTUNE` | `quarry_clear_fortune` | true | true | true | `quarryBlock` |
+
+`BuilderTileEntity.commonQuarryBlock` — the per-cell rule, in the jar's own order: skip the
+Builder's 3×3×3; skip air; skip `getDestroySpeed < 0`; skip the replacement block when the card
+does not clear; roll the block's drops with `getHarvesterTool` (a `Tiers.NETHERITE` tool over
+`mineable/pickaxe`, silk touch 1 or fortune 3), insert them into the container above the Builder
+else below, and only then `clearOrDirtBlock` (break sound, air when clearing, else
+`BuilderConfiguration.getQuarryReplace()`, written at `Block.UPDATE_CLIENTS`). The constants read:
+`quarryReplace` = `minecraft:dirt`, `quarryTileEntities` = true, `quarryChunkloads` = true,
+`builderRfPerQuarry` = 300 (energy, not carried).
+
+`ShapeCardItem.getVoidedBlocks` — seven material keys; each names one block (`dirt` names dirt
+*and* grass_block) and, with the card's `tagMatching` on, that material's tag. The jar's
+`Tags.Blocks.STONES`/`COBBLESTONES`/`SANDS`/`GRAVELS`/`NETHERRACKS`/`END_STONES` are the `c:`
+convention tags and `BlockTags.DIRT` is `minecraft:dirt`.
+
+### What the port carries
+
+- **The card type** (`runtime::CardKind`, `runtime::Quarry`, six constants): `suffix()`,
+  `parse()` (the suffix or the jar's item id), `description()` (the jar's `hudLogEntry`:
+  Normal / Silktouch / Fortune quarry). The type rides the card's **component** — the jar reads
+  it from the *item id* and this port carries one card item, so a card with no `type` is
+  upstream's `shape_card_def` (`CARD_SHAPE`), and a type this slice does not carry (`void`,
+  `pump`, …) reads as a shape card rather than growing a behaviour.
+- **The rule** (`runtime::quarry_step`, the `CellFacts` it takes, `QuarryStep`): the jar's
+  decision tree above, in its order, as one pure function with a test per branch.
+- **The drops**: `block_drops` with a netherite pickaxe (the same tier and tool tag as
+  `SuperHarvestingTool`) carrying `minecraft:silk_touch` or `minecraft:fortune 3` as the card
+  asks, inserted into the container above, else below (`insert_any`). Nothing is broken until
+  every drop fits.
+- **The replacement**: `BuilderConfiguration.quarryReplace`, defaulted to the jar's
+  `minecraft:dirt`, kept **per Builder** (the jar keeps it in a server config, and the package
+  format has no config file yet) and settable with `/rftoolsbuilder replace <pos> <block>`.
+- **The void list**: the seven material keys and `tagMatching` in the card's component (the
+  jar's own `voiding` / `tagMatching` names), matched against the block's id and, when tag
+  matching is on, against the material's block tag through `host.block_in_tag`.
+- **The `dontremoveme` tag**: a block a pack tags `rftoolsbuilder:dontremoveme` is never broken
+  (upstream creates the tag and ships no members; so does the port).
+- **The authoring**: `/rftoolsbuilder type <type>`, `void <material|none|all>`,
+  `tagmatching on|off`, `replace <pos> <block>`; `/rftoolsbuilder status` names the type, the
+  replacement and the void list, and says *quarried* rather than *placed*.
+
+### Upstream defect fixed (0.2.3)
+
+**A `dontremoveme` block hands out its drops while staying in place.**
+`commonQuarryBlock` rolls and inserts the drops, then calls `clearOrDirtBlock`, which returns
+early when the block carries the tag (`BuilderTileEntity.java:1246` inserts, `:1109-1114`
+returns) — so every pass duplicates the block's drops. The port checks the tag **before**
+anything is rolled (`quarry_cell`), so a tagged block is left alone and yields nothing.
+What a user notices: a protected block is no longer an infinite item source.
+
+### Deviations (deliberate)
+
+1. **The card type is a component field, not an item id** — one card item is carried, so the
+   type rides `rftoolsbuilder:shape_card.type`. This also means `CARD_QUARRY` and
+   `CARD_SHAPE` are the *same* item with different data, where the jar has nine items.
+2. **The replacement block is per Builder**, not a server config (no config file in the
+   package format); the jar's default is kept, and the pass restarts when it changes.
+3. **No partial break.** Upstream clears the block and holds unsendable drops in an overflow
+   list; the port waits at the cell instead, so a full container never destroys a block.
+4. **No energy.** `builderRfPerQuarry` and the hardness multiplier are not carried (gap 10);
+   a quarry runs free.
+5. **`quarryTileEntities` is not a switch**: the jar's default is `true`, so the port quarries
+   tile entities like any block; there is no GUI to turn it off.
+6. **Chunk loading** stays the jar's `quarryChunkloads=false` branch (gap 12).
+
+### Red → green
+
+- **Red (the API did not exist):** `cargo test` with the seven new tests written first →
+  `error[E0425]: cannot find type `Quarry` in this scope` … `error: could not compile
+  `rftoolsbuilder` (lib test) due to 84 previous errors` / `TEST_EXIT:101`
+  (`evidence/rftoolsbuilder/red-quarry-compile.log`).
+- **Red (the rule can fail):** with the replacement skip removed from `quarry_step`:
+  `assertion `left == right` failed: the quarry does not re-quarry its own replacement / left:
+  Harvest / right: Skip(Replacement)` / `test result: FAILED. 44 passed; 1 failed`
+  (`red-quarry-rule.log`); with the void branch returning `Harvest`:
+  `assertion `left == right` failed / left: Harvest / right: Void` (`red-quarry-void.log`).
+  Both runs `TEST_EXIT:101`, and the source was restored byte-for-byte (`diff` clean).
+- **Green:** `cargo test --offline` → `test result: ok. 45 passed; 0 failed` (`sdk-test.log`).
+
+### In game (0.2.3)
+
+The leg is `tools/e2e.sh` on the launcher-built two-package game, in the Overworld arena after
+the world-border phase. Quoted from `e2e-package.log`:
+
+```
+== QUARRY: a quarry card breaks the box beside the Builder and collects its drops ==
+quarry Builder: rftoolsbuilder:builder[facing=north]
+click: bar 'Builder at 22 102 -7: Box (Solid) 3x3x3 offset 6 0 0, 27 cells, quarry (Normal quarry), replacing with minecraft:dirt, voiding dirt, gravel (tags too), not started'; cards held 0
+quarry status: Builder at 22 102 -7: Box (Solid) 3x3x3 offset 6 0 0, 27 cells, quarry (Normal quarry), replacing with minecraft:dirt, voiding dirt, gravel (tags too), 27 quarried, 2 voided, scan complete
+collected: 25 cobblestone, 0 gravel, 0 coarse_dirt (total 25)
+== QUARRY: the card keeps its type and void list when it is taken out and put back ==
+status after the take-out: Builder at 22 102 -7: no shape card
+status after the put-back: Builder at 22 102 -7: Box (Solid) 3x3x3 offset 6 0 0, 27 cells, quarry (Normal quarry), replacing with minecraft:dirt, voiding dirt, gravel (tags too), 0 quarried, scan complete
+== QUARRY: tag matching off collects the tag's blocks again ==
+quarry status: … voiding dirt, gravel, 27 quarried, 1 voided, scan complete
+collected: 50 cobblestone, 0 gravel, 1 coarse_dirt
+== QUARRY: /rftoolsbuilder replace sets what a quarry leaves behind ==
+quarry status: … replacing with minecraft:cobblestone, voiding dirt, gravel, 27 quarried, scan complete
+== QUARRY: a clearing card leaves air, not the replacement block ==
+clearing status: … quarry (Normal quarry, clearing), 27 quarried, scan complete; collected 104 cobblestone
+== QUARRY: a silk card collects the block itself, where the plain one collects its drop ==
+silk status: … quarry (Silktouch quarry), replacing with minecraft:cobblestone, 27 quarried, scan complete; collected 27 stone and 104 cobblestone
+== QUARRY: a fortune card turns gravel into flint (fortune III makes the table's roll certain) ==
+fortune status: … quarry (Fortune quarry), replacing with minecraft:cobblestone, 27 quarried, scan complete; collected 1 flint, 0 gravel, 130 cobblestone
+== CONTROL: the same rig with a box card collects nothing ==
+control status: … 27 cells, 0 placed, scan complete; chest total: 159 -> 159
+```
+
+The rig: a Builder with a chest above it (inside its own 3×3×3, so never quarried) and a 3×3×3
+volume six blocks east of it holding 25 stone, one gravel and one coarse dirt. The card voids
+`gravel` by id and `dirt` through `minecraft:dirt`; the pass breaks all 27, replaces them with
+`minecraft:dirt`, collects the 25 stone cells' cobblestone and neither voided block. Every
+assertion can fail: `SELFTEST=quarry` flips the replacement expectation and the leg exits 1
+(`the quarry did not replace the 27 cells with minecraft:cobblestone (27 cells differ)`), and
+the box-card control fails if a shape card collects anything.
+
+| leg | result | log |
+|---|---|---|
+| package | **`PASS`** + `EXIT:0` | `../_shared/evidence/rftoolsbuilder-e2e/e2e-package.log` |
+| unmodded control | `FAIL: cannot give rftoolsbuilder:builder: this game does not carry the package` + `EXIT:1` | `e2e-control.log` |
+| `SELFTEST=1` | `FAIL: built 24 cells, expected 25` + `EXIT:1` | `e2e-selftest.log` |
+| `SELFTEST=quarry` | `FAIL: the quarry did not replace the 27 cells with minecraft:cobblestone (27 cells differ)` + `EXIT:1` | `e2e-quarry-selftest.log` |
+| log gate | `check-e2e-logs.py rftoolsbuilder-e2e --strict` | `logs=8 ok=8 missing-exit=0 bad-exit=0` |
+
+**Coverage — the quarry's families** (ruling 2026-11-20):
+
+| family | status | proof |
+|---|---|---|
+| the six `CARD_QUARRY*` types | **tested** | unit: the suffix/parse/description table, and `Shape::parse("quarry") == None` (a type, not a shape); in game: normal, silk, fortune and clear each run a 27-cell pass with their own readout |
+| `commonQuarryBlock`'s skip rule | **tested** | unit: near-Builder, air, unbreakable and replacement skips in the jar's order; in game: the second pass over the card's own replacement is `0 quarried` and collects nothing |
+| the drop paths (plain, silk touch, fortune 3) | **tested** | in game: stone → 25 cobblestone (plain), stone → 27 stone (silk), gravel → 1 flint and 0 gravel (fortune III) |
+| the void list by exact id | **tested** | the gravel cell is removed and **not** collected (chest total 25 of 27) |
+| the void list through tag matching | **tested** | coarse dirt voided with the toggle on (`2 voided`) and collected with it off (`1 voided`, +1 coarse dirt) |
+| the replacement block and `/rftoolsbuilder replace` | **tested** | all 27 cells `minecraft:dirt`, then `minecraft:cobblestone` after the command, and the readout names it |
+| the clearing flag | **tested** | a `quarry_clear` pass leaves air in all 27 cells and still collects |
+| the card's fields survive a move | **tested** | unit: the component round-trip incl. type, void list and toggle; in game: take out, put back, the readout still names the type, replacement and void list |
+| `dontremoveme` | unit-tested rule only | **not exercised in game**: the tag has no members in this world (upstream ships none either), so a cell can only carry it if a pack tags a block |
+| the jar's *resource scan* (`scanId`/`ShapeHandler`) | **not ported** | nothing in the quarry path needs it: this port reads the world cell by cell instead of composing a per-chunk map |
+| `CARD_VOID` | **not ported** | a different handler (`voidBlock`); it is the next card-type slice |
+| energy (`builderRfPerQuarry`, the hardness multiplier) | **not ported** | gap 10 |
+| chunk loading (`chunkLoad`/`chunkUnload`) | **not ported** | gap 12; the pin can express it (`TicketController` + `chunk.set_mod_forced`) |
+
+### Ladder (0.2.3)
+
+Every step ran through `ports/tools/build-slot.sh` (one lease per step, `CARGO_INCREMENTAL=0`,
+no `--target-dir`), with `BUILD_LOCAL=1` on the steps that need `cargo horizon-mod` and on the
+e2e (the remote runner has neither the subcommand nor the prepared 26.3 resources at these paths).
+
+| Step | Command | Result | Log |
+|---|---|---|---|
+| red (the API did not exist) | `cargo test --offline`, seven new tests first | `error[E0425]: cannot find type `Quarry` in this scope` … `due to 84 previous errors`, `TEST_EXIT:101` | `../_shared/evidence/rftoolsbuilder/red-quarry-compile.log` |
+| red (rule inverted, replacement skip removed) | the same | `assertion `left == right` failed: the quarry does not re-quarry its own replacement / left: Harvest / right: Skip(Replacement)`, 44 passed 1 failed | `red-quarry-rule.log` |
+| red (rule inverted, void branch) | the same | `assertion `left == right` failed / left: Harvest / right: Void`, 44 passed 1 failed | `red-quarry-void.log` |
+| unit tests | `cargo test --offline` | `running 45 tests` · `test result: ok. 45 passed; 0 failed`; doc-tests 0; exit 0 | `sdk-test.log` |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | `CLIPPY_EXIT:0`, 0 warnings | `clippy.log` |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | `FMT_EXIT:0` | `fmt.log` |
+| SDK gate | `cargo horizon-mod check` | 481 API items (was 421), `Made for 0a875da.`, exit 0 | `check.log` |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` | `Built ./target/horizon-mod/rftoolsbuilder.hmod` | `build.log` |
+| package twice | the same again | **`cmp` identical** | `build2.log` |
+| registry check | `cargo horizon-mod check rftoolsbuilder.hmod` | `rftoolsbuilder 0.2.3 (native-mod, format native-1/0a875da…/e59da90…, for 26.3)`, 69,798 B, `9efbb76f…a8b9`, exit 0 | `file-check-fits.log` |
+| fits, the pin | `cargo horizon-mod fits rftoolsbuilder.hmod --build 0a875da91dbb0fdcb7ba8c42c11341aa229af51a` | `0a875da  made for`, exit 0 | `sdk-fits.log` |
+| fits, **a different build** | `cargo horizon-mod fits rftoolsbuilder.hmod --build 0b14f8acfd97fa2c750e42795249dcc981178ca4` | `0b14f8a  fits`, exit 0 | `sdk-fits-other.log` |
+| package gate | `python3 ports/tools/verify-sdk-package.py rftoolsbuilder` | **1/1** (`31 entries`, runtime byte-identical, no packed `Cargo.lock`) | — |
+| in-game | the four legs above, on the launcher-built two-package game (0.2.3) | `PASS` + `EXIT:0`; control, `SELFTEST=1` and `SELFTEST=quarry` `EXIT:1` | `../_shared/evidence/rftoolsbuilder-e2e/*.log` |
+| log gate | `check-e2e-logs.py rftoolsbuilder-e2e --strict` | `logs=8 ok=8 missing-exit=0 bad-exit=0`, exit 0 | — |
+
 ## Gaps
 
 1. ~~**No in-game run.**~~ **Closed 2026-11-21**: `ports/tools/launcher-game.sh` and
@@ -556,8 +754,12 @@ need `cargo horizon-mod` (the remote runner has no such subcommand installed).
    (`e2e-package.log` `PASS` + `EXIT:0`, control and selftest `EXIT:1`). The
    script keeps the unmodded-game control, the `SELFTEST=1` leg and a
    `COUNTERFACTUAL=1` furnace leg, so a first run is fail-capable.
-2. **The quarry**, its resource scan, silk/fortune drops, the void list and the
-   replacement block (upstream `ShapeCardType.CARD_QUARRY*`).
+2. ~~**The quarry**, its resource scan, silk/fortune drops, the void list and the
+   replacement block (upstream `ShapeCardType.CARD_QUARRY*`).~~ **Carried
+   2026-11-23** (slice 3): the six card types, the three drop paths, the void list
+   with tag matching, the replacement block. What is left is the jar's *resource
+   scan* (`ShapeHandler`/`scanId`) — nothing in this slice needs it, the quarry
+   reads the world cell by cell — and `CARD_VOID`. Chunk loading stays as gap 12.
 3. **The movers**, their controls and the vehicle builder (`modules/mover`).
 4. **The shields** and their renderer (`modules/shield`).
 5. **The space chamber**, copy/move/swap modes, support blocks and the entity
@@ -574,7 +776,10 @@ need `cargo horizon-mod` (the remote runner has no such subcommand installed).
     player, so a placed block's own placement hook does not run (deviation 3).
 12. **Chunk loading**: upstream force-loads the chunk it is quarrying
     (`quarryChunkloads`, `ticketController.forceChunk`); the port reads
-    `is_loaded` and waits instead (a recorded difference, no ticket).
+    `is_loaded` and waits instead (a recorded difference, no ticket). The pin can
+    express the force-load branch (`Registrar::register_ticket_controller` +
+    `chunk.set_mod_forced`), so this is the next slice's work, not a gap in the
+    API.
 13. **The hilight mode, the progress HUD and the Builder's own renderer**
     (`updateHilight`, `IHudSupport`, `BuilderRenderer`).
 14. **The two recipes need `rftoolsbase:machine_frame`** (sibling port) and the
@@ -585,8 +790,9 @@ need `cargo horizon-mod` (the remote runner has no such subcommand installed).
 
 ## Verification
 
-Slice 1's run (0.2.0) is the table below; the current **0.2.2** numbers are in
-*Ladder (0.2.2)* above.
+Slice 1's run (0.2.0) is the table below; the current **0.2.3** numbers are in
+*Ladder (0.2.3)* in the slice-3 section above, and the file-level record is
+[`VALIDATION.md`](VALIDATION.md).
 
 Every command ran through `ports/tools/build-slot.sh` (one lease per step); logs
 in `ports/_shared/evidence/rftoolsbuilder/`. `/tmp` was full from other sessions'
@@ -629,11 +835,32 @@ Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-de
 ## Publishing
 
 MIT, rank 0. The current artifact is `ports/rftoolsbuilder/rftoolsbuilder.hmod`
-(**56,154 B**, `f09026b0f9f9cc91a2204f9231b07a595e62cda9f18e80ab46601ad049c5e872`),
-version **0.2.2** — an **update** of the entry this campaign owns (`Add
-rftoolsbuilder 0.2.0`, PR #1276, then 0.2.1 under review), so the PR title is
-`Update rftoolsbuilder 0.2.2` and the body names the superseded PR. Publishing
-still needs the maintainer's approval (ARCHITECTURE.md §8).
+(**69,798 B**, `9efbb76f1a8092a217c81410ebc58f55b0e1a9691841f43d90183e0ee66da8b9`), version **0.2.3** — an **update** of the entry
+this campaign owns (`Add rftoolsbuilder 0.2.0`, PR #1276, then 0.2.2 merged), so the
+PR title is `Update rftoolsbuilder 0.2.3` and the body names the superseded PR.
+Publishing still needs the maintainer's approval (ARCHITECTURE.md §8).
+
+**Changelog (0.2.3) — supersedes 0.2.2:**
+
+- **The quarry card type.** A card can be one of the jar's six quarry types
+  (`quarry`, `quarry_silk`, `quarry_fortune` and the three `quarry_clear` variants,
+  authored with `/rftoolsbuilder type`). In a Builder it breaks the blocks in the
+  card's box instead of building: the drops (plain, silk touch or fortune III) go
+  into the container above, else below, and the Builder's replacement block (the
+  jar's `minecraft:dirt`, settable with `/rftoolsbuilder replace`) is left behind —
+  or air, for a clearing card.
+- **The void list.** `/rftoolsbuilder void <stone|cobble|dirt|sand|gravel|netherrack|endstone>`
+  removes those blocks without collecting them, with `/rftoolsbuilder tagmatching`
+  extending each material to its block tag (the jar's `getVoidedBlocks`).
+- **The card's type, void list and toggle survive being taken out and put back**
+  (they are component fields, proven in game), and `/rftoolsbuilder status` names
+  the type, the replacement and the void list.
+- **An upstream defect fixed**: a `dontremoveme`-tagged block no longer hands out its
+  drops while staying in place (the jar rolls them before it reads the tag).
+- 45 tests (was 38), clippy `-D warnings` clean, `check` 0, `fits` `made for` at the
+  pin and `fits` at `0b14f8a`; in game `PASS` + `EXIT:0` with the quarry phases, the
+  unmodded control `EXIT:1`, `SELFTEST=1` `EXIT:1` and the new `SELFTEST=quarry`
+  `EXIT:1`.
 
 **Changelog (0.2.2) — supersedes 0.2.1:**
 
