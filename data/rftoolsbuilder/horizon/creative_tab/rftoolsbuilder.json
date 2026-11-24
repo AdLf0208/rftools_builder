@@ -2,7 +2,9 @@
   "icon": "rftoolsbuilder:builder",
   "items": [
     "rftoolsbuilder:builder",
-    "rftoolsbuilder:shape_card_def"
+    "rftoolsbuilder:shape_card_def",
+    "rftoolsbuilder:mover",
+    "rftoolsbuilder:mover_controller"
   ],
   "title": "itemGroup.rftoolsbuilder"
 }

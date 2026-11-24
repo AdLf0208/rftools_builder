@@ -1,6 +1,6 @@
 id = "rftoolsbuilder"
 name = "RFTools Builder"
-version = "0.2.9"
+version = "0.2.10"
 description = """RFTools Builder for Horizon: the Builder block and its shape cards. A card carries a
 shape (box, sphere, cylinder, capped cylinder, prism, cone, top and bottom dome, torus, heart) or
 one of the quarry card types (normal, silk touch, fortune, and their clearing variants) or the void
@@ -20,7 +20,10 @@ the filter, and /rftoolsbuilder forced reads the chunks its ticket holds. A pump
 water or lava source in its shape into the Builder's own fluid tank (and the same filter applies to
 quarry cards), one whole 1000 mB bucket per cell, charging the jar's builderRfPerLiquid 300 FE; a
 liquid card places a bucket of fluid from the tank into each replaceable cell, and /rftoolsbuilder
-fluid reads the tank's exact millibuckets back. The movers, shields, space chamber, composer,
+fluid reads the tank's exact millibuckets back. A mover controller spends the jar's 1000 FE per
+move to send the entities standing on a source mover to an available destination mover over
+floor(distance) interpolated ticks, transferring the vehicle card on arrival; /rftoolsbuilder
+move, movercard, moverstatus and movercharge drive it. The shields, space chamber, composer,
 projector and scanner are not carried."""
 authors = ["McJty"]
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins,

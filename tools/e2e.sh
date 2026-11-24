@@ -67,7 +67,8 @@
 # expects 17 skipped cells where the filter skips 18, so that run MUST end in `FAIL:`.
 # SELFTEST=filterquarry expects 17 skipped quarry cells where the pass skips 18, so that
 # run MUST end in `FAIL:` too. SELFTEST=pump expects 27001 mB where the rig holds 27000,
-# so that run MUST end in `FAIL:` too.
+# so that run MUST end in `FAIL:` too. SELFTEST=mover expects the cow three blocks beyond
+# the destination mover, so that run MUST end in `FAIL:` too.
 #
 # The mod is one flat `.hmod` the launcher compiles into the game, so GAME must
 # name a game the launcher built with it. The Builder's recipe needs
@@ -127,7 +128,7 @@ charge() { # charge X Y Z [amount]
     local amount=${4:-1000000} i out=""
     for i in 1 2 3 4 5; do
         mod charge "$1" "$2" "$3" "$amount"
-        out=$(ctl messages 20 | jq -r '.chat[]' \
+        out=$(ctl messages 20 | jq -r '.chat[]?' \
             | grep -E "^charged Builder at $1 $2 $3:|^not a builder" | head -1 || true)
         [ -n "$out" ] && { echo "$out"; return 0; }
         ctl wait 5 >/dev/null
@@ -139,7 +140,7 @@ energy() { # energy X Y Z
     local i out=""
     for i in 1 2 3 4 5; do
         mod energy "$1" "$2" "$3"
-        out=$(ctl messages 20 | jq -r '.chat[]' \
+        out=$(ctl messages 20 | jq -r '.chat[]?' \
             | grep -E "^Builder at $1 $2 $3: energy " | head -1 || true)
         [ -n "$out" ] && { echo "$out"; return 0; }
         ctl wait 5 >/dev/null
@@ -151,7 +152,7 @@ fluid() {
     local i out=""
     for i in 1 2 3 4 5; do
         mod fluid "$1" "$2" "$3"
-        out=$(ctl messages 20 | jq -r '.chat[]' \
+        out=$(ctl messages 20 | jq -r '.chat[]?' \
             | grep -E "^Builder at $1 $2 $3: fluid " | head -1 || true)
         [ -n "$out" ] && { echo "$out"; return 0; }
         ctl wait 5 >/dev/null
@@ -165,18 +166,18 @@ filter_spent_of() { sed -nE 's/.*filter skipped ([0-9]+) FE.*/\1/p' <<<"$1"; }
 # The command's answer, from chat, without the colour prefix.
 # The command's own answer: the newest chat line that reads as one (the buffer also holds the
 # scenario's earlier replies, so the *last* match is the answer to this command).
-reply() { mod "$@"; ctl messages 20 | jq -r '.chat[]' | grep -E '^(Builder|Card set to|Offset set to|Card reset|not a builder|Hold a shape card|Unknown|usage:|the last argument|[a-z0-9_.-]+:[a-z0-9_./-]+:)' | head -1 || true; }
+reply() { mod "$@"; ctl messages 20 | jq -r '.chat[]?' | grep -E '^(Builder|Card set to|Offset set to|Card reset|not a builder|Hold a shape card|Unknown|usage:|the last argument|[a-z0-9_.-]+:[a-z0-9_./-]+:)' | head -1 || true; }
 # `ctl messages` lists the newest chat line first, so the **first** match is the newest. A readout
 # can trail the tick the wait counts, so the command is repeated until a line newer than the one the
 # buffer held when the call began appears: an earlier phase's readout can never be mistaken for this
 # one's answer, and a readout that genuinely did not change is still returned.
 status() {
     local i before now=""
-    before=$(ctl messages 20 | jq -r '.chat[]' | grep -E "^Builder at $1 $2 $3:" | head -1 || true)
+    before=$(ctl messages 20 | jq -r '.chat[]?' | grep -E "^Builder at $1 $2 $3:" | head -1 || true)
     for i in 1 2 3 4 5 6; do
         mod status "$1" "$2" "$3"
         ctl wait 10 >/dev/null
-        now=$(ctl messages 20 | jq -r '.chat[]' | grep -E "^Builder at $1 $2 $3:" | head -1 || true)
+        now=$(ctl messages 20 | jq -r '.chat[]?' | grep -E "^Builder at $1 $2 $3:" | head -1 || true)
         if [ -n "$now" ] && [ "$now" != "$before" ]; then
             echo "$now"
             return 0
@@ -190,7 +191,7 @@ answer() {
     local i out=""
     for i in 1 2 3 4 5; do
         mod "$@"
-        out=$(ctl messages 20 | jq -r '.chat[]' | grep -E '^(Card set to|Card offset set to|Card type set to|Card voids|Card void list cleared|Card tag matching|Card filters|Card filter cleared|Builder replacement set to|Card reset|Hold a shape card|Unknown|unknown card type|unknown filter mode|unknown material|usage:|the last argument|not a builder)' | head -1 || true)
+        out=$(ctl messages 20 | jq -r '.chat[]?' | grep -E '^(Card set to|Card offset set to|Card type set to|Card voids|Card void list cleared|Card tag matching|Card filters|Card filter cleared|Builder replacement set to|Card reset|Hold a shape card|Unknown|unknown card type|unknown filter mode|unknown material|usage:|the last argument|not a builder)' | head -1 || true)
         if [ -n "$out" ]; then
             echo "$out"
             return 0
@@ -1293,4 +1294,100 @@ echo "quarry-water fluid: $line"
 
 QX=$o3_QX; QZ=$o3_QZ; VX1=$o_VX1; VX2=$o_VX2; VZ1=$o_VZ1; VZ2=$o_VZ2
 
-echo "PASS: both carried recipes craft in a real crafting table (the shape card from 4 paper, 2 bricks, 1 iron ingot and 2 redstone; the Builder from 4 bricks, an ender pearl, 3 redstone and a machine frame) with their ingredients consumed and their wrong-ingredient controls empty, the game log has no rejected ingredient, the Builder fills its 3x3x3 box from the chest above it (24 placed, 64 -> 40), a hollow 5x5x5 is a 98-cell shell (92 placed against a full chest), a box outside the world border builds 0 and spends nothing, a quarry card over 27 cells breaks them and leaves the configured replacement (25 cobblestone collected, the gravel and the tag-matched coarse dirt voided and not collected), the quarry card keeps its type and void list when it is taken out and put back, tag matching off collects the coarse dirt again, /rftoolsbuilder replace changes the replacement, a void card over 27 stone leaves 27 dirt with 27 quarried and 27 voided and collects nothing while a normal quarry card on the same rig collects all 27, a box card on the same rig collects nothing, a charged quarry's 27 cells spend exactly 8100 FE while a void card's spend 6750 FE and an empty buffer stalls at 0 quarried with 'not enough power', the Builder's loot table drops it, the card goes in, comes back out, resets to the 5x5x5 default, the placed volume survives a relaunch, a deny filter skips its 18 stone cells and spends exactly 18 x 50 = 900 FE on them while an empty filter spends 0, and a deny filter on a QUARRY card skips its 18 stone cells without breaking them or collecting their drops (9 quarried, 18 skipped, 900 FE, the chest holds only the 9 allowed dirt drops) while a filterless quarry on the same rig collects all 27, a pump card over 27 water sources moves exactly 27 x 1000 = 27000 mB into the Builder's tank and leaves the cells as air, a liquid card places the 27 buckets back and drains the tank to 0, and a quarry card on the same water rig collects no fluid"
+# --- the movers (slice 10) ---------------------------------------------------
+# The jar moves ENTITIES by interpolated per-tick position writes and writes
+# invisible marker/platform blocks; it does not teleport a block placed on the
+# source. The primary assertion is therefore the moved entity. A cow with NoAI
+# stands still on the source mover, the controller's `move` sends it to an
+# available destination mover over floor(distance) ticks, and the card transfers
+# on arrival. The block read at the destination is the mover MARKER block that
+# was placed there (not a block carried by the move — that would be an extension).
+MOVER=rftoolsbuilder:mover
+CONTROLLER=rftoolsbuilder:mover_controller
+manswer() { # a mover command through player chat; `ctl chat` does not carry a
+             # native command's reply, `ctl messages` does. Take only NEW lines
+             # so an earlier command's words cannot answer this assertion.
+    local prev out="" i
+    # `messages` is NEWEST FIRST, so the new reply is the head once it differs.
+    prev=$(ctl messages 20 2>/dev/null | jq -r '.chat[0] // empty' 2>/dev/null || true)
+    for i in 1 2 3 4 5; do
+        ctl chat "/rftoolsbuilder $*" >/dev/null 2>&1
+        ctl wait 5 >/dev/null
+        out=$(ctl messages 20 2>/dev/null | jq -r '.chat[0] // empty' 2>/dev/null || true)
+        [ -n "$out" ] && [ "$out" != "$prev" ] && { echo "$out"; return 0; }
+        ctl wait 3 >/dev/null
+    done
+    echo "$out"
+}
+cows_near() { # x z radius — type-filtered `ctl entities`, not an error-free reply
+    ctl entities 40 cow 2>/dev/null | jq -r --argjson x "$1" --argjson z "$2" --argjson r "$3" \
+        '[.entities[] | select(.type == "minecraft:cow")
+          | select(((.pos[0]-$x)*(.pos[0]-$x)) + ((.pos[2]-$z)*(.pos[2]-$z)) <= $r*$r)] | length' 2>/dev/null || echo 0
+}
+cow_list() { ctl entities 40 cow 2>/dev/null | jq -c '[.entities[] | select(.type == "minecraft:cow") | .pos]' 2>/dev/null || echo '[]'; }
+
+say "MOVER: a controller sends the cow on a source mover to an available destination"
+# The quarry phases teleported the player to the last rig, so anchor this rig to
+# the player's CURRENT position — `ctl entities` measures radius from the player.
+PXM=$(ctl state | jq -r '.player.position[0]' | cut -d. -f1)
+PZM=$(ctl state | jq -r '.player.position[2]' | cut -d. -f1)
+MX=$((PXM - 6)); MZ=$((PZM + 6)); DX=$((MX + 4)); CX=$MX; CZ=$((MZ + 3))
+ctl command "fill $((MX - 2)) 101 $((MZ - 2)) $((DX + 2)) 104 $((MZ + 2)) minecraft:air" >/dev/null 2>&1 || true
+ctl command "fill $((MX - 2)) 100 $((MZ - 2)) $((DX + 2)) 100 $((MZ + 2)) minecraft:stone" >/dev/null
+ctl wait 8 >/dev/null
+ctl setblock "$MX" 101 "$MZ" "$MOVER" >/dev/null
+ctl setblock "$DX" 101 "$MZ" "$MOVER" >/dev/null
+ctl setblock "$CX" 101 "$CZ" "$CONTROLLER" >/dev/null
+ctl wait 12 >/dev/null
+echo "source marker: $(block_name "$MX" 101 "$MZ"); destination marker: $(block_name "$DX" 101 "$MZ"); controller: $(block_name "$CX" 101 "$CZ")"
+[ "$(block_name "$MX" 101 "$MZ")" = "$MOVER" ] || fail "the source mover block did not load"
+[ "$(block_name "$DX" 101 "$MZ")" = "$MOVER" ] || fail "the destination mover block did not load"
+[ "$(block_name "$CX" 101 "$CZ")" = "$CONTROLLER" ] || fail "the mover controller block did not load"
+echo "controller charge: $(manswer movercharge "$CX" 101 "$CZ" 100000)"
+echo "source card: $(manswer movercard "$MX" 101 "$MZ" load)"
+echo "source status: $(manswer moverstatus "$MX" 101 "$MZ")"
+summon_reply=$(ctl command "summon minecraft:cow $((MX)).5 102 $((MZ)).5 {NoAI:1b,Silent:1b,PersistenceRequired:1b}" 2>&1)
+echo "cow summon: $summon_reply"
+ctl wait 12 >/dev/null
+echo "cow entities raw: $(ctl entities 40 cow 2>&1)"
+echo "cow before: $(cow_list)"
+echo "cow near source before: $(cows_near "$((MX + 0))" "$((MZ + 0))" 2)"
+[ "$(cows_near "$MX" "$MZ" 2)" -ge 1 ] || fail "no cow was standing on the source mover"
+move_reply=$(manswer move "$CX" 101 "$CZ" "$MX" 101 "$MZ" "$DX" 101 "$MZ")
+echo "move: $move_reply"
+echo "$move_reply" | grep -q "4 ticks, 1000 FE" || fail "the controller did not charge the jar's 1000 FE for a 4-tick move: $move_reply"
+ctl wait 80 >/dev/null
+echo "cow after: $(cow_list)"
+echo "source status after: $(manswer moverstatus "$MX" 101 "$MZ")"
+echo "destination status after: $(manswer moverstatus "$DX" 101 "$MZ")"
+expect_x=$((DX + 0))
+[ "$SELFTEST" = mover ] && expect_x=$((DX + 3))
+at_dest=$(cows_near "$expect_x" "$MZ" 2)
+at_source=$(cows_near "$MX" "$MZ" 2)
+echo "cows at destination $expect_x $MZ: $at_dest; at source $MX $MZ: $at_source"
+[ "$at_dest" -ge 1 ] || fail "the cow did not arrive at the destination mover (expected x=$expect_x)"
+[ "$at_source" -eq 0 ] || fail "the cow is still on the source mover after the move"
+echo "destination block: $(block_name "$DX" 101 "$MZ")"
+[ "$(block_name "$DX" 101 "$MZ")" = "$MOVER" ] || fail "the destination marker block is missing"
+
+say "MOVER CONTROL: with no vehicle card the cow stays on the source mover"
+SX2=$((DX + 6)); D2X=$((SX2 + 4))
+ctl command "fill $((SX2 - 2)) 101 $((MZ - 2)) $((D2X + 2)) 104 $((MZ + 2)) minecraft:air" >/dev/null 2>&1 || true
+ctl command "fill $((SX2 - 2)) 100 $((MZ - 2)) $((D2X + 2)) 100 $((MZ + 2)) minecraft:stone" >/dev/null
+ctl setblock "$SX2" 101 "$MZ" "$MOVER" >/dev/null
+ctl setblock "$D2X" 101 "$MZ" "$MOVER" >/dev/null
+ctl wait 10 >/dev/null
+ctl command "summon minecraft:cow $((SX2)).5 102 $((MZ)).5 {NoAI:1b,Silent:1b,PersistenceRequired:1b}" >/dev/null
+ctl wait 10 >/dev/null
+echo "control cow before: $(cow_list)"
+refusal=$(manswer move "$CX" 101 "$CZ" "$SX2" 101 "$MZ" "$D2X" 101 "$MZ")
+echo "control move: $refusal"
+echo "$refusal" | grep -q "no vehicle card" || fail "a cardless mover was allowed to move: $refusal"
+ctl wait 40 >/dev/null
+control_source=$(cows_near "$SX2" "$MZ" 2)
+control_dest=$(cows_near "$D2X" "$MZ" 2)
+echo "control cow at source: $control_source, at destination: $control_dest"
+[ "$control_source" -ge 1 ] || fail "the cardless control cow left its source"
+[ "$control_dest" -eq 0 ] || fail "the cardless control cow reached the destination"
+
+echo "PASS: both carried recipes craft in a real crafting table (the shape card from 4 paper, 2 bricks, 1 iron ingot and 2 redstone; the Builder from 4 bricks, an ender pearl, 3 redstone and a machine frame) with their ingredients consumed and their wrong-ingredient controls empty, the game log has no rejected ingredient, the Builder fills its 3x3x3 box from the chest above it (24 placed, 64 -> 40), a hollow 5x5x5 is a 98-cell shell (92 placed against a full chest), a box outside the world border builds 0 and spends nothing, a quarry card over 27 cells breaks them and leaves the configured replacement (25 cobblestone collected, the gravel and the tag-matched coarse dirt voided and not collected), the quarry card keeps its type and void list when it is taken out and put back, tag matching off collects the coarse dirt again, /rftoolsbuilder replace changes the replacement, a void card over 27 stone leaves 27 dirt with 27 quarried and 27 voided and collects nothing while a normal quarry card on the same rig collects all 27, a box card on the same rig collects nothing, a charged quarry's 27 cells spend exactly 8100 FE while a void card's spend 6750 FE and an empty buffer stalls at 0 quarried with 'not enough power', the Builder's loot table drops it, the card goes in, comes back out, resets to the 5x5x5 default, the placed volume survives a relaunch, a deny filter skips its 18 stone cells and spends exactly 18 x 50 = 900 FE on them while an empty filter spends 0, and a deny filter on a QUARRY card skips its 18 stone cells without breaking them or collecting their drops (9 quarried, 18 skipped, 900 FE, the chest holds only the 9 allowed dirt drops) while a filterless quarry on the same rig collects all 27, a pump card over 27 water sources moves exactly 27 x 1000 = 27000 mB into the Builder's tank and leaves the cells as air, a liquid card places the 27 buckets back and drains the tank to 0, a quarry card on the same water rig collects no fluid, and a mover controller spends the jar's 1000 FE to send a NoAI cow from a source mover to an available destination mover over exactly 4 interpolated ticks (arriving at the destination, not the source, with the marker block present) while a cardless source refuses the move and leaves its cow in place"

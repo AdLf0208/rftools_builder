@@ -54,7 +54,7 @@ charge() { # charge X Y Z [amount]
     local amount=${4:-1000000} i out=""
     for i in 1 2 3 4 5; do
         mod charge "$1" "$2" "$3" "$amount"
-        out=$(ctl messages 20 | jq -r '.chat[]' \
+        out=$(ctl messages 20 | jq -r '.chat[]?' \
             | grep -E "^charged Builder at $1 $2 $3:|^not a builder" | head -1 || true)
         [ -n "$out" ] && { echo "$out"; return 0; }
         ctl wait 5 >/dev/null
@@ -65,7 +65,7 @@ answer() {
     local i out=""
     for i in 1 2 3 4 5; do
         mod "$@"
-        out=$(ctl messages 20 | jq -r '.chat[]' \
+        out=$(ctl messages 20 | jq -r '.chat[]?' \
             | grep -E '^(Card set to|Card offset set to|Card type set to|Card tag matching)' | head -1 || true)
         [ -n "$out" ] && { echo "$out"; return 0; }
         ctl wait 5 >/dev/null
@@ -77,7 +77,7 @@ status() {
     for i in 1 2 3 4 5 6; do
         mod status "$1" "$2" "$3"
         ctl wait 6 >/dev/null
-        out=$(ctl messages 20 | jq -r '.chat[]' | grep -E "^Builder at $1 $2 $3:" | head -1 || true)
+        out=$(ctl messages 20 | jq -r '.chat[]?' | grep -E "^Builder at $1 $2 $3:" | head -1 || true)
         [ -n "$out" ] && { echo "$out"; return 0; }
     done
     echo "$out"
@@ -87,20 +87,20 @@ status() {
 status_now() {
     ctl chat "/rftoolsbuilder status $1 $2 $3" >/dev/null
     ctl wait 3 >/dev/null
-    ctl messages 20 | jq -r '.chat[]' | grep -E "^Builder at $1 $2 $3:" | head -1 || true
+    ctl messages 20 | jq -r '.chat[]?' | grep -E "^Builder at $1 $2 $3:" | head -1 || true
 }
 # One `/forced` call. The reply starts with `Forced chunks at`, so it can never
 # be mistaken for a status readout (`Builder at`).
 forced_now() {
     mod forced "$1" "$2" "$3"
-    ctl messages 20 | jq -r '.chat[]' | grep -E '^Forced chunks at' | head -1 || true
+    ctl messages 20 | jq -r '.chat[]?' | grep -E '^Forced chunks at' | head -1 || true
 }
 # A two-tick poll: the pass finishes in about four ticks once the chunk arrives,
 # so the ticket must be sampled immediately after the card is installed.
 forced_fast() {
     ctl chat "/rftoolsbuilder forced $1 $2 $3" >/dev/null
     ctl wait 2 >/dev/null
-    ctl messages 20 | jq -r '.chat[]' | grep -E '^Forced chunks at' | head -1 || true
+    ctl messages 20 | jq -r '.chat[]?' | grep -E '^Forced chunks at' | head -1 || true
 }
 chest_total() { ctl container "$1" "$2" "$3" | jq -r '[.slots[]? | .count] | add // 0'; }
 

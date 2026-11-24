@@ -30,17 +30,19 @@ cards), slice 2 (the carried recipes repaired to the 26.3 dialect and proven in
 game), slice 3 (the quarry card type, its void list and the replacement block),
 slice 4 (`CARD_VOID`), slice 5 (quarry chunk loading), slice 6 (the FE buffer
 and the per-cell cost), slice 7 (the filter module and filtered placement),
-slice 8 (the quarry's filter path) and slice 9 (the pump/liquid cards and the
-Builder's fluid tank) are implemented, their 62 runtime tests and 12
-glue tests (74 in all) are green, the SDK gate is green,
+slice 8 (the quarry's filter path), slice 9 (the pump/liquid cards and the
+Builder's fluid tank) and slice 10 (the movers) are implemented, their 68 runtime
+tests and 12 glue tests (80 in all) are green, the SDK gate is green,
 and the package is **verified in a launcher-built game**: the modded leg passes
 every phase including the quarry's, the void card's, the exact energy-consumption
-readout, both filters' 18 × 50 FE skip spends and the force-load leg, the unmodded
-control and the eight selftest legs fail. The gap list below is the rest of the mod.
+readout, both filters' 18 × 50 FE skip spends, the force-load leg and the mover's
+per-tick entity transport, the unmodded control and the nine selftest legs fail.
+The gap list below is the rest of the mod.
 
-Package at **0.2.9**: **92,715 B**, SHA-256
-`626a18010cc73899efdad449bcc666c7af3a4992eb352a3727e463372c8b01db`, built twice byte-identically against SDK **`0a875da9…`** + mixins
+Package at **0.2.10**: **107,914 B**, SHA-256
+`6d8c51ea9f8d2fc8c18a8defc3bdf649b4a947a475e523b42eb011264f034a3b`, built twice byte-identically against SDK **`0a875da9…`** + mixins
 `e59da90…` (`check` exit 0, `fits` `made for` at the pin and `fits` at `0b14f8a`).
+The 0.2.9 artifact (`92,715 B`, `626a1801…01db`) is retired in `evidence/rftoolsbuilder/`.
 The command → exact-output → log table for every number below is
 [`VALIDATION.md`](VALIDATION.md); the canonical logs are `sdk-test.log`,
 `sdk-fits.log`, `sdk-fits-other.log`, and the 0.2.0 measurements are retired in
@@ -1557,6 +1559,171 @@ back to 0 mB, and the quarry differential collects none. `SELFTEST=pump` expects
 
 Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
 
+## Slice 10 (0.2.10, 2026-11-24) — the movers (`modules/mover`)
+
+The gap line this slice answers, verbatim from *Gaps* 3: *"**The movers**, their
+controls and the vehicle builder (`modules/mover`)."* Class `content`, tier
+`deep` — the one remaining family that genuinely needs entities, and the gate
+record above measured every surface stamped and reachable from a BE tick
+(`EntityRef::teleport_to`, `LevelRef::entities_in`, `LevelRef::set_block`). No
+new dimension or client renderer: the shape is two block-entity Parts, pure
+position/tick rules and four commands.
+
+### The artefact's rules, read with `javap` (not inferred)
+
+Jar `rftoolsbuilder-1.21-7.0.8.jar`, branch `1.21_neo` @ `409049466`; bytecode
+in `/tmp/opencode/rfb-gate-mover/{controller,logic}.txt` and
+`/tmp/opencode/rfb-gate2/gate2.txt`:
+
+| Rule | Bytecode | Value carried |
+|---|---|---|
+| `rfPerMove` | `sipush 1000` under "Amount of RF used for one movement" | **1000 FE** |
+| controller max / receive | `ldc 100000` / `sipush 1000` | 100,000 / 1,000 FE |
+| `getPowerPerMove` | `(int)(rfPerMove * (2 - infused) / 2)` | 1000 at infusion 0 |
+| `getTotalTicks` | `(long)((float)sqrt(distToCenterSqr(dest, source corner)))` | `floor(4.555…) = 4` for a four-block span |
+| `getMovingPosition` | `source.lerp(dest, (tick - start + f) / total)` | corner-to-corner lerp |
+| `actualMoveServer` | `getMovingPosition(now+1) - getMovingPosition(now)` → `doGrab(dx,dy,dz)`; `arriveAtDestination` when `now - start >= totalTicks` | one straight-line step per tick |
+| `arriveAtDestination` | card → destination slot 0, source card cleared, both ends' source/destination cleared | `arrival_flags` |
+| `isAvailable` | slot 0 empty, no destination, no source | `mover_available` |
+| `grabEntities` | `getEntitiesOfClass(Entity, getVehicleAABB())`, `id → Vec3` | the AABB of the vehicle card's blocks |
+
+**Artefact correction obeyed.** The jar moves **entities** by
+`getEntity(id).setPos(old + delta)` and writes invisible marker/platform blocks
+with `setBlock`; a block placed on the source mover is *not* teleported. The
+primary in-game assertion is the moved entity. The `ctl block <destination>`
+read is the **mover marker block placed there by the rig**, not a block the move
+carried. Reading a block id that the move itself wrote would be a declared port
+extension, not fidelity, so none is claimed.
+
+**Semantic difference recorded:** the jar's `setPos` zeroes `fallDistance`,
+sets delta movement to zero and `onGround = true`; the pin's `teleport_to` is a
+`/tp`-style position write that keeps those fields. The position/tick schedule
+is pure in `runtime.rs`; the physics-field difference is declared here.
+
+### What the port carries
+
+- **Content:** the jar's `mover` and `mover_controller` blockstates, block/item
+  models, `machinemover.png` and `machinemovercontroller.png` (verbatim), their
+  loot tables (with the un-carried `mcjtylib:*` / `rftoolsbuilder:mover_data`
+  `copy_components` dropped as for the Builder), block/item declarations on the
+  `minecraft:stonecutter` template and two creative-tab entries. No new recipe.
+- **Two block-entity Parts:** `Mover` (one card slot, ticks) and
+  `MoverController` (the 100,000 FE buffer). The mover's state lives in seven
+  menu data slots — the command→tick channel — so the controller can set a
+  destination from outside the mover's own tick. The slots are **in-memory**,
+  a recorded difference from the jar's saved `MoverData`: a move in flight does
+  not survive a relaunch.
+- **Pure rules** (`runtime.rs`): `RF_PER_MOVE`, `power_per_move`, `total_ticks`,
+  `moving_position`, `step_delta`, `arrived`, `mover_available`, `arrival_flags`,
+  `grab_volume` and the two byte-stable readouts, each with a test. The grab
+  volume is a fixed 3×3 of cells above the mover (the jar derives an AABB from
+  the vehicle card's blocks; this package carries a one-cell vehicle). The
+  entities are **re-read each tick** instead of grabbed once and held by id.
+- **Commands:** `/rftoolsbuilder move <controller> <source> <dest>` (the jar's
+  GUI node/vehicle selection is replaced by positions), `movercard <pos>
+  load|none`, `moverstatus <pos>` and `movercharge <pos> <amount>`. `/move`
+  checks the FE, that the source holds a vehicle card and that the destination
+  is available, charges the fee through the `ENERGY` capability, and writes the
+  destination and `totalTicks` onto the source. The mover tick applies the
+  delta with `teleport_to` and transfers the card on arrival.
+
+### Red → green
+
+- **Red (before the code existed):** the six planner tests written first failed
+  to compile with 33 errors — `error[E0425]: cannot find function mover_available
+  in this scope`, `… arrival_flags …`, `… mover_line …`, `… controller_line …`,
+  `error: could not compile rftoolsbuilder (lib test) due to 33 previous errors`,
+  `TEST_EXIT:101` (`evidence/rftoolsbuilder/red-mover-compile.log`).
+- **Red (rule inverted):** with `total_ticks` changed from truncation to
+  `ceil`, `the_per_tick_delta_is_the_straight_line_step_and_arrival_ends_it`
+  passed but `total_ticks_is_the_floored_centre_distance` failed
+  `assertion \`left == right\` failed`, 79 passed 1 failed, `TEST_EXIT:101`
+  (`red-mover-rule.log`). The source was restored byte-for-byte (`diff` clean).
+- **A defect in the test itself was caught:** the first green attempt asserted
+  `arrived(3, 4)`, but the jar arrives only when `now - start >= total`. The
+  test was corrected, not the rule.
+- **Green:** `cargo test --offline` → `running 80 tests` · `test result: ok. 80
+  passed; 0 failed` (`sdk-test.log`, regenerated after the final build: 68
+  runtime + 12 glue).
+
+### In game (0.2.10)
+
+Quoted from `../_shared/evidence/rftoolsbuilder-e2e/e2e-package.log` — a NoAI
+cow on a source mover, an available destination mover four blocks east, and a
+charged controller, all read through `ctl`:
+
+```
+== MOVER: a controller sends the cow on a source mover to an available destination ==
+source marker: rftoolsbuilder:mover; destination marker: rftoolsbuilder:mover; controller: rftoolsbuilder:mover_controller
+controller charge: charged Mover Controller at -13 101 -19: 0 -> 100000 FE (inserted 100000)
+source card: vehicle card loaded
+source status: Mover at -13 101 -22: 0/0 ticks to 0 0 0, delivered 0, 0/100000 FE
+cow before: [[-13.5,102.0,-22.5]]
+move: move: -13 101 -22 -> -9 101 -22, 4 ticks, 1000 FE
+cow after: [[-9.5,102.0,-22.5]]
+source status after: Mover at -13 101 -22: 4/4 ticks to -9 101 -22, delivered 0, 0/100000 FE
+destination status after: Mover at -9 101 -22: 0/0 ticks to 0 0 0, delivered 1, 0/100000 FE
+cows at destination -9 -22: 1; at source -13 -22: 0
+destination block: rftoolsbuilder:mover
+== MOVER CONTROL: with no vehicle card the cow stays on the source mover ==
+control move: no vehicle card in the source mover
+control cow at source: 1, at destination: 0
+```
+
+Every assertion can fail: `SELFTEST=mover` expects the cow three blocks beyond
+the destination and exits 1 at `FAIL: the cow did not arrive at the destination
+mover (expected x=-10)` (`e2e-mover-selftest.log`); the unmodded control fails at
+`cannot give rftoolsbuilder:builder` (`e2e-control.log`); the cardless source
+refuses `move` and leaves its cow in place.
+`check-e2e-logs.py rftoolsbuilder-e2e --strict` → `logs=25 ok=25
+missing-exit=0 bad-exit=0`, exit 0 (the canonical negative logs of the earlier
+slices remain green; this slice re-ran the package, control, mover-selftest,
+`SELFTEST=1` and the chunk-load legs on 0.2.10).
+
+**Coverage — the mover family:**
+
+| family | status | proof |
+|---|---|---|
+| `rfPerMove` / controller buffer | **tested** | unit: `the_movers_power_per_move_is_the_jars_thousand_fe_at_infusion_zero`; in game: `move` charges exactly 1000 FE and `movercharge` fills 0 → 100000 |
+| `totalTicks = floor(distance)` | **tested** | unit: 4 for a four-block span, 5 for (3,4,0), 0 for same cell; in game: the reply names `4 ticks` and the source reads `4/4` |
+| interpolated per-tick position write | **tested** | in game: a type-filtered `ctl entities` moves the cow from `-13.5` to `-9.5` on X, unchanged on Y/Z, and the source reads 0 cows |
+| teleport vs `setPos` difference | **tested (declared)** | the pure schedule is unit-tested; the physics-field difference is recorded above, not claimed as fidelity |
+| `arriveAtDestination` card transfer | **tested** | in game: destination `delivered 1` and source card cleared after the pass |
+| `isAvailable` / a destination in use | **tested** | unit: `an_available_mover_has_no_card_and_no_pending_move`; in game: a cardless source is refused and leaves the cow |
+| mover/controller blocks, markers and loot | **tested** | placed with `setblock`, read back with `ctl block`, unknown ids refused by `give` (the carried-recipe phase) |
+| the grab AABB and vehicle-card block list | **not ported (simplified)** | a fixed 3×3 volume, re-read each tick; the jar's card-derived AABB and grabbed-id map are recorded differences |
+| GUI control pages, vehicle builder/status modules, sound | **not ported** | gap 3 remains for those; the four commands are the package's surface |
+
+### Harness notes worth keeping
+
+- The charge loop must be sized by `max_insert`, not a fixed 64 iterations:
+  64 × 1000 FE capped the controller at 64,000 FE (`BUILD_LOCAL` re-run fixed it).
+- `ctl messages` is **newest first**; a command's reply is the head once it
+  differs from the pre-command head. `ctl chat` itself carries no native-command
+  reply. `.chat[]?` avoids a jq abort when the buffer has no chat array.
+- `ctl entities` measures radius from the **player**, and the quarry phases
+  teleport the player to the last rig — anchor a new rig to the player's
+  current position, not to the first arena's `X`/`Z1`.
+
+### Ladder (0.2.10)
+
+| Step | Command | Result |
+|---|---|---|
+| red (unit) | `cargo test --offline`, six planner tests first | 33 compile errors, `TEST_EXIT:101` |
+| red (rule) | `total_ticks` → `ceil` | `assertion left == right failed`, 79 passed 1 failed, `TEST_EXIT:101` |
+| unit tests | `cargo test --offline` | `80 passed; 0 failed` |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | `CLIPPY_EXIT:0`, 0 warnings |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | `FMT_EXIT:0` |
+| SDK gate | `cargo horizon-mod check` | 536 API items (6 Part kinds, 3 capabilitys), `Made for 0a875da.`, `CHECK_EXIT:0` |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | `CMP_IDENTICAL`, 107,914 B |
+| registry check | `cargo horizon-mod check rftoolsbuilder.hmod` | `rftoolsbuilder 0.2.10 (native-mod, … for 26.3)`, `FILE_CHECK_EXIT:0` |
+| fits, the pin / a different build | `… --build 0a875da…` / `--build 0b14f8a…` | `made for` / `fits`, both exit 0 |
+| package gate | `verify-sdk-package.py rftoolsbuilder` | **1/1** (`package matches the tree`, runtime byte-identical `c6bbec5e23f2`, R9 clean, 45 entries, no packed `Cargo.lock`) |
+| game build | `bundle-game.sh` (stale `native-*` tags removed) | `Compiling rftoolsbase (1 of 2)` / `Compiling rftoolsbuilder (2 of 2)`, `native-0a875da-169cea786318` |
+| in-game | the package leg + negatives | `PASS` + `EXIT:0`; control and selftests `EXIT:1` |
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices,rust-port
+
 ## Gaps
 
 1. ~~**No in-game run.**~~ **Closed 2026-11-21**: `ports/tools/launcher-game.sh` and
@@ -1573,7 +1740,13 @@ Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-de
   (slice 4, 0.2.4: the seventh card type, the 0.5 factor and the `"    Void mode"`
   HUD string read from the jar; its deliberate replacement-block difference is in
   the slice-4 section). Chunk loading stays as gap 12.
-3. **The movers**, their controls and the vehicle builder (`modules/mover`).
+3. ~~**The movers**, their controls and the vehicle builder (`modules/mover`).~~
+   **Carried 2026-11-24** (slice 10, 0.2.10): the controller's 1000 FE-per-move,
+   `floor(distance)` ticks and interpolated per-tick entity writes, card
+   transfer on arrival, two mover/controller blocks and four commands. The GUI
+   control pages, the vehicle builder and status modules, the card-derived AABB
+   and the grabbed-id map stay out of scope (the slice-10 section records the
+   differences).
 4. **The shields** and their renderer (`modules/shield`).
 5. **The space chamber**, copy/move/swap modes, support blocks and the entity
    modes (`SpaceChamberControllerBlock`, `BuilderMode`).
@@ -1664,11 +1837,30 @@ Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-de
 ## Publishing
 
 MIT, rank 0. The current artifact is `ports/rftoolsbuilder/rftoolsbuilder.hmod`
-(**92,715 B**, `626a18010cc73899efdad449bcc666c7af3a4992eb352a3727e463372c8b01db`), version **0.2.9** — an **update** of the entry
+(**107,914 B**, `6d8c51ea9f8d2fc8c18a8defc3bdf649b4a947a475e523b42eb011264f034a3b`), version **0.2.10** — an **update** of the entry
 this campaign owns (`Add rftoolsbuilder 0.2.0`, PR #1276, then 0.2.2 merged; 0.2.3 through
-0.2.8 staged on PR #1827), so the PR title is `Update rftoolsbuilder 0.2.9` and
+0.2.9 staged on PR #1827), so the PR title is `Update rftoolsbuilder 0.2.10` and
 the body names the superseded PR. Publishing still needs the maintainer's approval
 (ARCHITECTURE.md §8).
+
+**Changelog (0.2.10) — supersedes 0.2.9:**
+
+- **The movers.** A mover controller spends the jar's 1000 FE per move to send
+  the entities standing on a source mover to an available destination mover
+  over `floor(distance)` interpolated ticks, transferring the vehicle card on
+  arrival. The pure planner (`power_per_move`, `total_ticks`, `moving_position`,
+  `step_delta`, `arrival_flags`) lives in `runtime.rs` with six new tests; the
+  pin's `teleport_to` stands in for the jar's physics-zeroing `setPos` (a
+  declared difference). `/rftoolsbuilder move|movercard|moverstatus|movercharge`
+  drive it, and the jar's mover/controller blockstates, models, textures and
+  loot tables are carried. The GUI control pages, vehicle builder and status
+  modules are not carried.
+- 80 tests (was 74), clippy `-D warnings` clean, `check` 0 (536 API items),
+  `fits` `made for` at the pin and `fits` at `0b14f8a`; in game `PASS` + `EXIT:0`
+  with the cow moving exactly four blocks (a type-filtered `ctl entities`
+  position read), the card counted at the destination, the marker block read
+  back and a cardless source refusing the move, the unmodded control `EXIT:1`,
+  `SELFTEST=1` `EXIT:1` and the new `SELFTEST=mover` `EXIT:1`.
 
 **Changelog (0.2.7) — supersedes 0.2.6:**
 
@@ -1793,3 +1985,42 @@ the body names the superseded PR. Publishing still needs the maintainer's approv
 - Not included: the quarry, movers, shields, space chamber, composer, projector,
   scanner, GUI, liquid cards, filter module, energy, and the composition/scan
   shapes.
+
+## Gate record (entity/block movement surface) — 2026-11-24, before 0.2.10
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
+
+**Verdict: gate PASS.** The pin can move an entity between two positions and read/write a block at a position from a server tick. No `blocked(<symbol>)`. No version was built by this gate; the orchestrator dispatches 0.2.10.
+
+### The artefact's mover rules (read first — jar `rftoolsbuilder-1.21-7.0.8.jar`, branch `1.21_neo` @ `409049466`)
+
+Bytecode read with `javap -c -p`; the class files were not translated, only their rules extracted:
+
+- `MoverControllerTileEntity.setupMovement(vehicle, destination)`: refuses when `energyStorage.getEnergyStored() < getPowerPerMove()`, finds the source `MoverTileEntity` by name, fills a blank destination from `traverseBreadthFirst`, consumes `getPowerPerMove()` FE, then `startMove(sourcePos, destination, moverName)`. `startMove` strips a ` -> ` separator and writes `VehicleCard.setDesiredDestination(card, sourcePos, name)` onto the vehicle card. The `CMD_MOVE` handler (`lambda$static$12`) supplies `SELECTED_NODE` (the source), `SELECTED_VEHICLE` and `SELECTED_DESTINATION`; `CMD_SCAN` is `doScan`.
+- `MoverTileEntity.setSource(pos)` writes `logic.source`; `isAvailable()` requires an empty card slot and no pending source/destination; `arriveAtDestination()` reads the block entity at `logic.destination`, requires a `MoverTileEntity`, ends the move on the source, moves the card into the destination's slot 0, clears the source's card, calls `setSource(null)` on the destination and `setDestination(null)` on the source.
+- `EntityMovementLogic.setupMovementTo(dest)`: the destination must be an **available `MoverTileEntity`**; it sets that mover's source to this mover's position, sets its own `destination`, `totalDist = (long)sqrt(distToCenterSqr)` (integer ticks), `starttick = level.getGameTime()`, then `grabEntities()`.
+- `EntityMovementLogic.grabEntities()` collects `level.getEntitiesOfClass(Entity.class, getVehicleAABB())` and records `id -> Vec3` (the entity's offset at grab time). `actualMoveServer()` computes the per-tick delta from `getMovingPosition(starttick)` to `getMovingPosition(gameTime + 1)`, calls `doGrab(dx,dy,dz)` and, when `gameTime - starttick >= totalTicks`, calls `arriveAtDestination()`.
+- `lambda$doGrab$1`: for each live grabbed id, `level.getEntity(id).setPos(old + delta)`, `setOldPosAndRot()`, `fallDistance = 0`, `setDeltaMovement(Vec3.ZERO)`, `setOnGround(true)`. **Transport is a per-tick entity-position write**, not a block move; the block side is the mover/status marker blocks and `InvisibleMoverBlock` platforms written with `Level.setBlock`. A plain block placed on the source mover is *not* teleported to the destination by the jar — a block-id-at-destination assertion would be a declared port extension, not artefact fidelity.
+
+### Surface evidence — every candidate stamped, reachable from a server tick
+
+| Symbol (public method) | Declaration / wire | Stamp in `surface.json` |
+|---|---|---|
+| `EntityRef::teleport_to(host: &mut dyn ServerHost, pos: [f64;3], rotation: Option<[f32;2]>) -> bool` | `generated/mod_api_generated_host.rs:1133`; backend `horizon-mod-vocab/src/host/entities.rs:651`; guest `horizon-mod-api/generated/wire_guest_generated.rs:1366` | `handle:EntityRef::teleport_to` (line 80099). Doc: *"Moves the entity to `pos` in its level (`Entity.teleportTo`), as `/tp` does"*, `#[access(WorldOnly)]` |
+| `EntityRef::teleport_to_level(...)` | `mod_api_generated_host.rs:1160`; `host/entities.rs:684` | `handle:EntityRef::teleport_to_level` (line 80110) |
+| `EntityRef::position(host: &dyn Host) -> Option<[f64;3]>` | `mod_api_generated_host.rs:517` | `handle:EntityRef::position` (line 79692) |
+| `LevelRef::entities_in(host: &dyn Host, min, max) -> Option<Vec<EntityRef>>` | `mod_api_generated_host.rs:1716` (the artefact's `getEntitiesOfClass` AABB grab) | `handle:LevelRef::entities_in` (line 83295) |
+| `LevelRef::set_block(host: &mut dyn ServerHost, pos, state, flags) -> Result<bool, LevelWriteError>` | `mod_api_generated_host.rs:2145`; host `horizon-mod-vocab/src/world/types.rs:1480/1494` | `handle:LevelRef::set_block` (line 84161) — **already used by this port's tick** (`src/support.rs:1456,1589,1666`) |
+| `LevelRef::block_state(host: &dyn Host, pos) -> Option<BlockState>` | `mod_api_generated_host.rs:1731` | `handle:LevelRef::block_state` (line 82961) |
+| `MobRef::move_to(host: &mut dyn ServerHost, at, speed) -> bool` | `mod_api_generated_host.rs:3750` — smooth path alternative for a mob rider | `handle:MobRef::move_to` (line 86501) |
+
+Reachability: `BlockPart::block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent)` (`horizon-mod-api/src/parts/block_entities.rs:197`, implemented by this port at `src/support.rs:279,934`). The writes take exactly that `&mut dyn ServerHost`; the reads take `&dyn Host`, from which `&mut dyn ServerHost` coerces. `teleport_to` is `#[access(WorldOnly)]`, which a block-entity tick satisfies.
+
+Semantic difference to record if 0.2.10 is built: the jar's `setPos` also zeroes fall distance and vertical delta and sets `onGround`; the SDK write is `teleport_to` (a `/tp`-style position write), so the port keeps the position/tick schedule in pure `runtime.rs` and applies it with `teleport_to`, declaring the physics-field difference. The same-level `teleport_to` keeps these entities as the same handles, so a grabbed entity can be counted before/after.
+
+### Proposed 0.2.10 plan — the movers (`modules/mover`), gated slice
+
+- **Family / gap line:** gap 3, verbatim: *"**The movers**, their controls and the vehicle builder (`modules/mover`)."* Class `content`, tier `deep` — the one family that genuinely needs entities/AI; no new dimension or client renderer.
+- **Surface:** a mover controller block entity plus two mover marker block entities (source and destination) and one control/status readout; a vehicle card whose data holds a name and desired destination (the artefact's `VehicleCard.setDesiredDestination`). Pure `runtime.rs`: grab-AABB sizing, `totalTicks = floor(distance)`, interpolated position schedule, arrival guard, energy-per-move check, card transfer on arrival. No new block model or recipe beyond what the jar names; content carried as the jar's mover/control/status blockstates and models.
+- **In-game assertion (fail-capable):** place a source mover and an available destination mover, put a distinct entity (a named cow or minecart) on the source, set the destination through the controller's `move` command, tick to `totalTicks`; a type-filtered `ctl entities` count/positions must show that entity at the destination and not at the source, and `ctl block <destination>` must read the destination marker. Counterfactual: a controller with no card / no available destination leaves the entity on the source (`ctl entities` unchanged), and `SELFTEST=mover` flips the expected destination (or the count) and ends `EXIT:1`. Keep the control and selftest `EXIT:1` lines and run `check-e2e-logs.py rftoolsbuilder-e2e --strict`.
+- **Caveat for the orchestrator:** the block-id-at-destination sub-assertion in the dispatch note is not the jar's behaviour (the jar moves the *entity*, and writes invisible platform blocks along the path). Prove the moved entity as the primary assertion; if a distinct placed block must also be read at the destination, record it as a declared port extension, not fidelity.

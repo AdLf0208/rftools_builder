@@ -27,9 +27,13 @@ use crate::runtime::{
     self, BLOCKS_PER_TICK, BUILDER_CELLS, Card, CardKind, CellCharge, CellFacts, DONT_REMOVE_ME,
     ENERGY_CAPACITY, ENERGY_MAX_INSERT, EnergyStatus, FLUID_TANK_CAPACITY, FORTUNE_LEVEL, Filter,
     FilterMode, FluidFacts, FluidStatus, FluidStep, FluidWait, INFUSION_FACTOR, LOOKUPS_PER_TICK,
-    Progress, QUARRY_REPLACE, QUARRY_TOOL, Quarry, QuarryStep, Refusal, RefusalReason, Scan, Shape,
-    Status, Voiding, adjusted_cost, cell_cost, energy_line, filter_match, filter_skip_cost,
-    fluid_cost, fluid_line, fluid_step, tank_after,
+    MOV_SLOT_COUNT, MOV_SLOT_DELIVERED, MOV_SLOT_DEST, MOV_SLOT_DONE, MOV_SLOT_FLAGS,
+    MOV_SLOT_TOTAL, MOVER_CONTROLLER_MAX_RF, MOVER_CONTROLLER_RECEIVE, MOVER_HAS_CARD,
+    MOVER_MOVING, MoverStatus, Progress, QUARRY_REPLACE, QUARRY_TOOL, Quarry, QuarryStep, Refusal,
+    RefusalReason, Scan, Shape, Status, Voiding, adjusted_cost, arrival_flags, arrived, cell_cost,
+    controller_line, energy_line, filter_match, filter_skip_cost, fluid_cost, fluid_line,
+    fluid_step, grab_volume, mover_available, mover_line, moving_position, power_per_move,
+    step_delta, tank_after, total_ticks,
 };
 
 /// The compound key type, taken from `Tag::String`'s own payload: the API does not re-export the
@@ -184,6 +188,28 @@ fn ticket_controller() -> TicketController {
         .expect("registration runs before every hook")
 }
 
+/// The mover marker block (`modules/mover/MoverTileEntity`).
+const MOVER: &str = "rftoolsbuilder:mover";
+/// The mover controller block (`MoverControllerTileEntity`).
+const MOVER_CONTROLLER: &str = "rftoolsbuilder:mover_controller";
+const MOVER_BE_TYPE: &str = "rftoolsbuilder:mover_block_entity";
+const CONTROLLER_BE_TYPE: &str = "rftoolsbuilder:mover_controller_block_entity";
+
+static MOVER_KEY: OnceLock<BlockKey> = OnceLock::new();
+static CONTROLLER_KEY: OnceLock<BlockKey> = OnceLock::new();
+
+fn mover_key() -> BlockKey {
+    *MOVER_KEY
+        .get()
+        .expect("registration runs before every hook")
+}
+
+fn controller_key() -> BlockKey {
+    *CONTROLLER_KEY
+        .get()
+        .expect("registration runs before every hook")
+}
+
 // ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
@@ -248,6 +274,61 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
     tank.inputs = vec![0];
     tank.outputs = vec![0];
     registrar.block_fluids(&block, tank);
+
+    // --- the movers --------------------------------------------------------
+    // A mover marker holds one vehicle card (the jar's `MoverTileEntity` slot 0)
+    // and ticks: each tick applies the interpolated position write to the
+    // entities in its grab volume. Its state lives in menu data slots so the
+    // controller's `move` command can set a destination from outside its tick.
+    let mover_block = registrar.block_key(MOVER);
+    let _ = MOVER_KEY.set(mover_block);
+    let mover_kind = registrar
+        .block_entity_type(MOVER_BE_TYPE)
+        .blocks(&[MOVER])
+        .build();
+    registrar
+        .block_entity_part(&mover_kind, Mover)
+        .expect("one Part per mover block-entity type");
+    #[expect(
+        clippy::needless_update,
+        reason = "the update is for a field a later game build may add"
+    )]
+    let mover_container = ModContainer {
+        slots: 1,
+        faces: std::array::from_fn(|_| vec![0]),
+        inputs: vec![0],
+        outputs: vec![0],
+        menu: None,
+        ..ModContainer::default()
+    };
+    registrar.block_container(&mover_block, mover_container);
+
+    // The controller stores the jar's 100,000 FE / 1,000 FE-per-tick buffer. It
+    // has an extract face as a harness stand-in for spending `rfPerMove` — the
+    // jar consumes it directly from its own `GenericEnergyStorage`.
+    let controller_block = registrar.block_key(MOVER_CONTROLLER);
+    let _ = CONTROLLER_KEY.set(controller_block);
+    let controller_kind = registrar
+        .block_entity_type(CONTROLLER_BE_TYPE)
+        .blocks(&[MOVER_CONTROLLER])
+        .build();
+    registrar
+        .block_entity_part(&controller_kind, MoverController)
+        .expect("one Part per controller block-entity type");
+    #[expect(
+        clippy::needless_update,
+        reason = "the update is for a field a later game build may add"
+    )]
+    let controller_battery = ModEnergyBuffer {
+        capacity: MOVER_CONTROLLER_MAX_RF as i32,
+        max_insert: MOVER_CONTROLLER_RECEIVE as i32,
+        max_extract: MOVER_CONTROLLER_MAX_RF as i32,
+        insert_faces: [true; 6],
+        extract_faces: [true; 6],
+        ..ModEnergyBuffer::default()
+    };
+    registrar.block_energy(&controller_block, controller_battery);
+
     let card = registrar.item_key(CARD_ITEM);
     registrar.item_part(card, ShapeCardItem);
 }
@@ -278,6 +359,49 @@ impl BlockEntityPart for Builder {
     /// One server tick: walk the card's shape and place what fits.
     fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
         tick(host, event);
+    }
+}
+
+/// A mover marker: it ticks while a move is in flight and carries one vehicle
+/// card slot (`MoverTileEntity`).
+struct Mover;
+
+#[mod_api::horizon_part]
+impl BlockPart for Mover {}
+
+#[mod_api::horizon_part]
+impl BlockEntityPart for Mover {
+    fn block_entity(
+        &self,
+        _level: LevelSide<'_>,
+        _event: &mut BlockEntityEvent<'_>,
+    ) -> Option<Compound> {
+        Some(Compound::new())
+    }
+
+    fn block_entity_ticks(&self, _host: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
+        event.ticks = true;
+    }
+
+    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+        mover_tick(host, event);
+    }
+}
+
+/// The mover controller: it holds the FE buffer and receives the `move` command.
+struct MoverController;
+
+#[mod_api::horizon_part]
+impl BlockPart for MoverController {}
+
+#[mod_api::horizon_part]
+impl BlockEntityPart for MoverController {
+    fn block_entity(
+        &self,
+        _level: LevelSide<'_>,
+        _event: &mut BlockEntityEvent<'_>,
+    ) -> Option<Compound> {
+        Some(Compound::new())
     }
 }
 
@@ -1258,6 +1382,110 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The movers (0.2.10)
+// ---------------------------------------------------------------------------
+
+/// A mover's menu data slots, read from outside its own tick. The slots are
+/// the command→tick channel: `/rftoolsbuilder move` writes them, the mover's
+/// tick reads and advances them. They are in-memory (not saved), a recorded
+/// difference from the jar's saved `MoverData`.
+fn mover_data(host: &dyn Host, pos: [i32; 3]) -> Option<Vec<i32>> {
+    let level = host.level(host.dimension())?;
+    host.block_entity(level, pos)?.data_slots(host)
+}
+
+fn write_mover_data(host: &mut dyn ServerHost, pos: [i32; 3], mut slots: Vec<i32>) -> bool {
+    slots.resize(MOV_SLOT_COUNT, 0);
+    let Some(level) = host.level(host.dimension()) else {
+        return false;
+    };
+    let Some(entity) = host.block_entity(level, pos) else {
+        return false;
+    };
+    entity.set_data_slots(host, slots).unwrap_or(false)
+}
+
+/// One mover tick. The jar's `EntityMovementLogic.actualMoveServer` writes each
+/// grabbed entity's position by the interpolated per-tick delta, then calls
+/// `arriveAtDestination` when `gameTime - starttick >= totalTicks`. The port
+/// keeps the schedule in `runtime.rs` and re-reads the grab volume each tick
+/// (a recorded difference: the jar holds entity ids from grab time).
+fn mover_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+    let at = event.pos;
+    let flags = event.entity.data.get(MOV_SLOT_FLAGS).copied().unwrap_or(0);
+    if flags & MOVER_MOVING == 0 {
+        return;
+    }
+    let total = event.entity.data.get(MOV_SLOT_TOTAL).copied().unwrap_or(0) as i64;
+    let done = event.entity.data.get(MOV_SLOT_DONE).copied().unwrap_or(0) as i64;
+    let dest = [
+        event
+            .entity
+            .data
+            .get(MOV_SLOT_DEST)
+            .copied()
+            .unwrap_or(at[0]),
+        event
+            .entity
+            .data
+            .get(MOV_SLOT_DEST + 1)
+            .copied()
+            .unwrap_or(at[1]),
+        event
+            .entity
+            .data
+            .get(MOV_SLOT_DEST + 2)
+            .copied()
+            .unwrap_or(at[2]),
+    ];
+
+    if arrived(done, total) {
+        // `MoverTileEntity.arriveAtDestination`: the card goes into the
+        // destination's slot 0, the source's card and both ends' pending move
+        // are cleared. The card is a flag in the saved slots here.
+        let dest_slots = mover_data(host, dest).unwrap_or_default();
+        let dest_flags = dest_slots.get(MOV_SLOT_FLAGS).copied().unwrap_or(0);
+        let (source_flags, dest_flags) = arrival_flags(flags, dest_flags);
+        let mut written = dest_slots;
+        written.resize(MOV_SLOT_COUNT, 0);
+        written[MOV_SLOT_FLAGS] = dest_flags;
+        written[MOV_SLOT_DELIVERED] = written[MOV_SLOT_DELIVERED].saturating_add(1);
+        write_mover_data(host, dest, written);
+        event.entity.data[MOV_SLOT_FLAGS] = source_flags;
+        event.entity.data[MOV_SLOT_DONE] = total as i32;
+        *event.reply = mod_api::BlockEntityTickReply::Changed;
+        return;
+    }
+
+    let Some(level) = host.level(host.dimension()) else {
+        return;
+    };
+    let here = moving_position(at, dest, done, total);
+    let cell = [
+        here[0].round() as i32,
+        here[1].round() as i32,
+        here[2].round() as i32,
+    ];
+    let (min, max) = grab_volume(cell);
+    let Some(entities) = level.entities_in(host, min, max) else {
+        return;
+    };
+    let delta = step_delta(at, dest, total);
+    for entity in entities {
+        let Some(pos) = entity.position(host) else {
+            continue;
+        };
+        let _ = entity.teleport_to(
+            host,
+            [pos[0] + delta[0], pos[1] + delta[1], pos[2] + delta[2]],
+            None,
+        );
+    }
+    event.entity.data[MOV_SLOT_DONE] = (done + 1) as i32;
+    *event.reply = mod_api::BlockEntityTickReply::Changed;
+}
+
 /// What one quarry cell did.
 enum QuarryCell {
     /// The block must not be broken here (air, the replacement, unbreakable, the Builder's own
@@ -2127,6 +2355,21 @@ pub(crate) fn on_register_commands(event: &mut RegisterCommandsEvent<'_>) {
     event.commands.push(Command::new(
         "rftoolsbuilder replace <pos:block_pos> <block:resource:minecraft:block>",
     ));
+
+    // The movers. The jar selects nodes/vehicles by name in a GUI; this package
+    // names them by block position (a recorded simplification).
+    event.commands.push(Command::new(
+        "rftoolsbuilder move <controller:block_pos> <source:block_pos> <dest:block_pos>",
+    ));
+    event.commands.push(Command::new(
+        "rftoolsbuilder movercard <pos:block_pos> <mode:word>",
+    ));
+    event
+        .commands
+        .push(Command::new("rftoolsbuilder moverstatus <pos:block_pos>"));
+    event.commands.push(Command::new(
+        "rftoolsbuilder movercharge <pos:block_pos> <amount:integer>",
+    ));
 }
 
 /// Their bodies (`run_mod_command`).
@@ -2245,8 +2488,231 @@ pub(crate) fn on_run_mod_command(
             feedback(host, &line);
             Flow::Cancel
         }
+        "move" => {
+            let line = move_between(host, event);
+            feedback(host, &line);
+            Flow::Cancel
+        }
+        "movercard" => {
+            let line = mover_card(host, event);
+            feedback(host, &line);
+            Flow::Cancel
+        }
+        "moverstatus" => {
+            let line = mover_status(host, event);
+            feedback(host, &line);
+            Flow::Cancel
+        }
+        "movercharge" => {
+            let line = mover_charge(host, event);
+            feedback(host, &line);
+            Flow::Cancel
+        }
         _ => Flow::Continue,
     }
+}
+
+/// Whether the block at `pos` is one of ours, by its registered block key.
+fn is_of(host: &dyn Host, pos: [i32; 3], key: BlockKey) -> bool {
+    host.level(host.dimension())
+        .and_then(|level| level.block(host, pos))
+        == Some(key)
+}
+
+fn is_mover(host: &dyn Host, pos: [i32; 3]) -> bool {
+    is_of(host, pos, mover_key())
+}
+
+fn is_controller(host: &dyn Host, pos: [i32; 3]) -> bool {
+    is_of(host, pos, controller_key())
+}
+
+/// The controller's `CMD_MOVE` body: check the FE per move, that the source
+/// holds a vehicle card and that the destination is available, then queue the
+/// destination on the source mover.
+fn move_between(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> String {
+    let Some(CommandArgumentValue::BlockPos(controller)) = event.command.argument("controller")
+    else {
+        return "usage: /rftoolsbuilder move <controller> <source> <dest>".to_owned();
+    };
+    let Some(CommandArgumentValue::BlockPos(source)) = event.command.argument("source") else {
+        return "usage: /rftoolsbuilder move <controller> <source> <dest>".to_owned();
+    };
+    let Some(CommandArgumentValue::BlockPos(dest)) = event.command.argument("dest") else {
+        return "usage: /rftoolsbuilder move <controller> <source> <dest>".to_owned();
+    };
+    let (controller, source, dest) = (*controller, *source, *dest);
+    if !is_controller(host, controller) {
+        return "not a mover controller".to_owned();
+    }
+    if !is_mover(host, source) || !is_mover(host, dest) {
+        return "not a mover".to_owned();
+    }
+    let Some(level) = host.level(host.dimension()) else {
+        return "no level for the mover".to_owned();
+    };
+    let stored = host
+        .block_entity(level, controller)
+        .and_then(|entity| entity.data(host))
+        .map_or(0, |saved| energy_of(&saved));
+    let fee = power_per_move(INFUSION_FACTOR);
+    if stored < fee {
+        return format!("mover needs {fee} FE, has {stored} FE");
+    }
+    let source_flags = mover_data(host, source)
+        .and_then(|slots| slots.get(MOV_SLOT_FLAGS).copied())
+        .unwrap_or(0);
+    if source_flags & MOVER_MOVING != 0 {
+        return "the source mover is already moving".to_owned();
+    }
+    if source_flags & MOVER_HAS_CARD == 0 {
+        return "no vehicle card in the source mover".to_owned();
+    }
+    let dest_flags = mover_data(host, dest)
+        .and_then(|slots| slots.get(MOV_SLOT_FLAGS).copied())
+        .unwrap_or(0);
+    if !mover_available(dest_flags) {
+        return "the destination mover is not available".to_owned();
+    }
+    let total = total_ticks(source, dest);
+    let spent = host
+        .transaction(|host, tx| -> Result<u32, ()> {
+            let Some(buffer) = level.capability(&mut *host, &ENERGY, controller, None) else {
+                return Ok(0);
+            };
+            Ok(buffer.extract(&mut *host, tx, fee))
+        })
+        .unwrap_or(0);
+    if spent < fee {
+        return format!("mover needs {fee} FE, extracted {spent} FE");
+    }
+    let mut slots = vec![0i32; MOV_SLOT_COUNT];
+    slots[MOV_SLOT_FLAGS] = MOVER_HAS_CARD | MOVER_MOVING;
+    slots[MOV_SLOT_TOTAL] = total as i32;
+    slots[MOV_SLOT_DONE] = 0;
+    slots[MOV_SLOT_DEST] = dest[0];
+    slots[MOV_SLOT_DEST + 1] = dest[1];
+    slots[MOV_SLOT_DEST + 2] = dest[2];
+    write_mover_data(host, source, slots);
+    format!(
+        "move: {} {} {} -> {} {} {}, {total} ticks, {fee} FE",
+        source[0], source[1], source[2], dest[0], dest[1], dest[2]
+    )
+}
+
+/// Load or clear the one vehicle card a mover holds (`MoverTileEntity` slot 0).
+fn mover_card(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> String {
+    let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos") else {
+        return "usage: /rftoolsbuilder movercard <pos> <load|none>".to_owned();
+    };
+    let Some(CommandArgumentValue::String(mode)) = event.command.argument("mode") else {
+        return "usage: /rftoolsbuilder movercard <pos> <load|none>".to_owned();
+    };
+    if !is_mover(host, *pos) {
+        return "not a mover".to_owned();
+    }
+    let mut slots = mover_data(host, *pos).unwrap_or_default();
+    slots.resize(MOV_SLOT_COUNT, 0);
+    let answer = match mode.as_str() {
+        "load" => {
+            slots[MOV_SLOT_FLAGS] |= MOVER_HAS_CARD;
+            "vehicle card loaded"
+        }
+        "none" => {
+            slots[MOV_SLOT_FLAGS] &= !MOVER_HAS_CARD;
+            "vehicle card cleared"
+        }
+        _ => return "usage: /rftoolsbuilder movercard <pos> <load|none>".to_owned(),
+    };
+    write_mover_data(host, *pos, slots);
+    answer.to_owned()
+}
+
+/// The byte-stable mover readout, driven by the game's own saved slots.
+fn mover_status(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> String {
+    let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos") else {
+        return "usage: /rftoolsbuilder moverstatus <pos>".to_owned();
+    };
+    if is_controller(host, *pos) {
+        let level = host.level(host.dimension());
+        let energy = level
+            .and_then(|level| host.block_entity(level, *pos))
+            .and_then(|entity| entity.data(host))
+            .map_or(0, |saved| energy_of(&saved));
+        return controller_line(*pos, energy);
+    }
+    if !is_mover(host, *pos) {
+        return "not a mover".to_owned();
+    }
+    let slots = mover_data(host, *pos).unwrap_or_default();
+    let get = |index: usize| slots.get(index).copied().unwrap_or(0);
+    mover_line(&MoverStatus {
+        at: *pos,
+        flags: get(MOV_SLOT_FLAGS),
+        total: get(MOV_SLOT_TOTAL) as i64,
+        done: get(MOV_SLOT_DONE) as i64,
+        dest: [
+            get(MOV_SLOT_DEST),
+            get(MOV_SLOT_DEST + 1),
+            get(MOV_SLOT_DEST + 2),
+        ],
+        delivered: get(MOV_SLOT_DELIVERED),
+        energy: 0,
+    })
+}
+
+/// The controller's cable stand-in, specular to the Builder's `charge`.
+fn mover_charge(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> String {
+    let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos") else {
+        return "usage: /rftoolsbuilder movercharge <pos> <amount>".to_owned();
+    };
+    let Some(CommandArgumentValue::Integer(amount)) = event.command.argument("amount") else {
+        return "usage: /rftoolsbuilder movercharge <pos> <amount>".to_owned();
+    };
+    if !is_controller(host, *pos) {
+        return "not a mover controller".to_owned();
+    }
+    let Some(level) = host.level(host.dimension()) else {
+        return "no level for the mover controller".to_owned();
+    };
+    let stored = |host: &dyn Host| {
+        host.block_entity(level, *pos)
+            .and_then(|entity| entity.data(host))
+            .map_or(0, |saved| energy_of(&saved))
+    };
+    let before = stored(&*host);
+    let wanted = u32::try_from((*amount).max(0))
+        .unwrap_or(u32::MAX)
+        .saturating_sub(before);
+    let mut inserted = 0u32;
+    // One insert is capped at `max_insert` (1000 FE here), so the loop must be
+    // sized by the wanted amount, not the Builder's 20,000-FE cadence.
+    for _ in 0..=MOVER_CONTROLLER_MAX_RF / MOVER_CONTROLLER_RECEIVE {
+        if inserted >= wanted {
+            break;
+        }
+        let took = host
+            .transaction(|host, tx| -> Result<u32, ()> {
+                let Some(buffer) = level.capability(&mut *host, &ENERGY, *pos, None) else {
+                    return Ok(0);
+                };
+                Ok(buffer.insert(&mut *host, tx, wanted - inserted))
+            })
+            .unwrap_or(0);
+        if took == 0 {
+            break;
+        }
+        inserted += took;
+    }
+    format!(
+        "charged Mover Controller at {} {} {}: {} -> {} FE (inserted {})",
+        pos[0],
+        pos[1],
+        pos[2],
+        before,
+        stored(&*host),
+        inserted
+    )
 }
 
 /// `/rftoolsbuilder type <type>`: the card's `ShapeCardType` (the jar's item id picks it, and

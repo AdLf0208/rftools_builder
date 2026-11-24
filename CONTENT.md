@@ -9,6 +9,8 @@ MIT). Every file below was compared with the jar: sizes and SHA-256 are in
 | id | template | why |
 |---|---|---|
 | `rftoolsbuilder:builder` | `minecraft:stonecutter` | the jar's blockstate is the four-way horizontal `facing`; `stonecutter` carries exactly that state (the sibling `rftoolsbase:machine_infuser` uses the same template). Properties from McJty's `defaultProperties()`: hardness 2.0, blast resistance 2.0, correct tool required, metal (`minecraft:iron_block`) sounds, full-cube outline and collision. |
+| `rftoolsbuilder:mover` | `minecraft:stonecutter` | the mover marker (source and destination), same properties; the jar's blockstate has a single model with no `facing`. Its block entity holds one vehicle-card slot and the move's data slots. |
+| `rftoolsbuilder:mover_controller` | `minecraft:stonecutter` | the controller with the jar's 100,000 FE / 1,000 FE-per-tick buffer; the jar's blockstate has the six `facing` variants. |
 
 `assets/rftoolsbuilder/blockstates/builder.json` is the jar's own file, byte for
 byte (367 B, `51e6e01c…aaf8f6b54`): `facing=east` is the model turned 90°,
@@ -24,11 +26,19 @@ machine casing.
 | `rftoolsbuilder:shape_card_def` | `minecraft:paper` | `max_stack_size: 1`, as upstream's `stacksTo(1)`; its shape lives in the `rftoolsbuilder:shape_card` component. |
 
 The quarry (0.2.3), the void card (0.2.4), quarry chunk loading (0.2.5), the FE
-buffer (0.2.6) and the filter (0.2.7) add **no content**: the jar has nine shape-card items and this port carries one, so the
+buffer (0.2.6), the filter (0.2.7) and the pump/liquid cards (0.2.9) add **no content**: the jar has nine shape-card items and this port carries one, so the
 card *type* (`ShapeCardType`) rides the same component as the shape (`type`,
 `voiding`, `tagMatching`), the replacement block is the Builder's own saved data, and
 the force-load ticket is registered in Rust (`register_ticket_controller`). No texture,
 model, lang line or recipe is added for either card type or for chunk loading.
+
+**Slice 10 (0.2.10)** carries the movers' two blockstates (`mover.json`,
+`mover_controller.json`), four block models and two item models, the jar's
+`machinemover.png` (777 B) and `machinemovercontroller.png` (6,746 B), the two
+loot tables (with the un-carried `mcjtylib:*` / `rftoolsbuilder:mover_data`
+`copy_components` dropped, as for the Builder), two block/item declarations and
+two creative-tab/lang entries. The jar's other mover control/status/vehicle
+blocks stay out of scope; no new recipe is added.
 
 ## Textures
 

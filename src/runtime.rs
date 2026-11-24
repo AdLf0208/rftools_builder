@@ -1908,6 +1908,151 @@ pub fn filter_skip_cost() -> u32 {
     cell_cost(CellCharge::Skipped)
 }
 
+// ---------------------------------------------------------------------------
+// The movers (`modules/mover`, 0.2.10)
+// ---------------------------------------------------------------------------
+
+/// `MoverConfiguration.rfPerMove`, read from the jar's own constant pool
+/// ("Amount of RF used for one movement", `sipush 1000`).
+pub const RF_PER_MOVE: u32 = 1000;
+/// `MoverConfiguration.moverControllerMaxRF` (`ldc 100000`).
+pub const MOVER_CONTROLLER_MAX_RF: u32 = 100_000;
+/// `MoverConfiguration.moverControllerRFPerTick` (`sipush 1000`).
+pub const MOVER_CONTROLLER_RECEIVE: u32 = 1000;
+/// The mover's one card slot (upstream's `MoverTileEntity` slot 0).
+pub const MOVER_CARD_SLOT: u32 = 0;
+
+/// Flag bits in a mover's saved data: a card in its slot and a move in flight.
+/// These are the two conditions `MoverTileEntity.isAvailable` reads.
+pub const MOVER_HAS_CARD: i32 = 1;
+pub const MOVER_MOVING: i32 = 2;
+
+/// The mover's menu data slots. Commands write them with
+/// `BlockEntityRef::set_data_slots`; the BE tick reads them from `event.entity.data`.
+pub const MOV_SLOT_FLAGS: usize = 0;
+pub const MOV_SLOT_TOTAL: usize = 1;
+pub const MOV_SLOT_DONE: usize = 2;
+pub const MOV_SLOT_DEST: usize = 3;
+pub const MOV_SLOT_DELIVERED: usize = 6;
+pub const MOV_SLOT_COUNT: usize = 7;
+
+/// `MoverControllerTileEntity.getPowerPerMove`:
+/// `(int)(rfPerMove * (2 - infusedFactor) / 2)` at infusion factor 0 is 1000 FE.
+#[must_use]
+pub fn power_per_move(infused: f32) -> u32 {
+    ((RF_PER_MOVE as f32 * (2.0 - infused) / 2.0) as i32).max(0) as u32
+}
+
+/// `EntityMovementLogic.getTotalTicks`: the float-truncated square root of
+/// `BlockPos.distToCenterSqr` — the *centre* of the destination block against
+/// the source block's corner — so a four-block span is four ticks, not five.
+#[must_use]
+pub fn total_ticks(source: [i32; 3], dest: [i32; 3]) -> i64 {
+    let sq: f64 = (0..3)
+        .map(|i| {
+            let d = dest[i] as f64 + 0.5 - source[i] as f64;
+            d * d
+        })
+        .sum();
+    (sq.sqrt() as f32) as i64
+}
+
+/// `EntityMovementLogic.getMovingPosition`: a corner-to-corner lerp by
+/// `tick / total`. The jar interpolates with `(gameTime - starttick + f)`, which
+/// the port drives with an explicit tick counter (`ticks_done`).
+#[must_use]
+pub fn moving_position(source: [i32; 3], dest: [i32; 3], tick: i64, total: i64) -> [f64; 3] {
+    if total <= 0 {
+        return [source[0] as f64, source[1] as f64, source[2] as f64];
+    }
+    let t = (tick as f64 / total as f64).clamp(0.0, 1.0);
+    std::array::from_fn(|i| source[i] as f64 + (dest[i] as f64 - source[i] as f64) * t)
+}
+
+/// The per-tick entity write: `getMovingPosition(gameTime + 1) - getMovingPosition(gameTime)`,
+/// i.e. the straight-line step `(dest - source) / totalTicks`.
+#[must_use]
+pub fn step_delta(source: [i32; 3], dest: [i32; 3], total: i64) -> [f64; 3] {
+    if total <= 0 {
+        return [0.0; 3];
+    }
+    std::array::from_fn(|i| (dest[i] - source[i]) as f64 / total as f64)
+}
+
+/// `actualMoveServer` ends the move when `gameTime - starttick >= totalTicks`.
+#[must_use]
+pub fn arrived(done: i64, total: i64) -> bool {
+    total <= 0 || done >= total
+}
+
+/// `MoverTileEntity.isAvailable`: an empty card slot and no pending source or
+/// destination. The port keeps the two pending halves as one flag.
+#[must_use]
+pub fn mover_available(flags: i32) -> bool {
+    flags & (MOVER_HAS_CARD | MOVER_MOVING) == 0
+}
+
+/// `arriveAtDestination`: the card moves into the destination's slot 0, the
+/// source's card and both ends' pending move are cleared.
+#[must_use]
+pub fn arrival_flags(source: i32, dest: i32) -> (i32, i32) {
+    (
+        source & !MOVER_HAS_CARD & !MOVER_MOVING,
+        dest | MOVER_HAS_CARD,
+    )
+}
+
+/// The vehicle's grab volume. Upstream derives an AABB from the vehicle card's
+/// block list; this package carries a one-cell vehicle, so the AABB is the
+/// mover cell and the 3×3 of cells above it.
+#[must_use]
+pub fn grab_volume(at: [i32; 3]) -> ([f64; 3], [f64; 3]) {
+    (
+        [at[0] as f64 - 1.0, at[1] as f64, at[2] as f64 - 1.0],
+        [at[0] as f64 + 2.0, at[1] as f64 + 2.0, at[2] as f64 + 2.0],
+    )
+}
+
+/// A mover's saved state, as the byte-stable `/moverstatus` line prints it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoverStatus {
+    pub at: [i32; 3],
+    pub flags: i32,
+    pub total: i64,
+    pub done: i64,
+    pub dest: [i32; 3],
+    pub delivered: i32,
+    pub energy: u32,
+}
+
+/// The byte-stable mover readout.
+#[must_use]
+pub fn mover_line(s: &MoverStatus) -> String {
+    format!(
+        "Mover at {} {} {}: {}/{} ticks to {} {} {}, delivered {}, {}/{} FE",
+        s.at[0],
+        s.at[1],
+        s.at[2],
+        s.done,
+        s.total,
+        s.dest[0],
+        s.dest[1],
+        s.dest[2],
+        s.delivered,
+        s.energy,
+        MOVER_CONTROLLER_MAX_RF
+    )
+}
+
+/// The byte-stable controller readout.
+#[must_use]
+pub fn controller_line(at: [i32; 3], energy: u32) -> String {
+    format!(
+        "Controller at {} {} {}: {}/{} FE, {} FE/move",
+        at[0], at[1], at[2], energy, MOVER_CONTROLLER_MAX_RF, RF_PER_MOVE
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3527,6 +3672,72 @@ mod tests {
                 amount: 0,
             }),
             "Builder at 0 0 0: fluid none 0 mB (capacity 64000 mB), bucket 1000 mB, 300 FE/cell"
+        );
+    }
+
+    // --- the movers (0.2.10) ---------------------------------------------
+
+    #[test]
+    fn the_movers_power_per_move_is_the_jars_thousand_fe_at_infusion_zero() {
+        assert_eq!(RF_PER_MOVE, 1000);
+        assert_eq!(power_per_move(INFUSION_FACTOR), 1000);
+        assert_eq!(power_per_move(1.0), 500);
+        assert_eq!(power_per_move(2.0), 0);
+    }
+
+    #[test]
+    fn total_ticks_is_the_floored_centre_distance() {
+        assert_eq!(total_ticks([10, 100, 10], [14, 100, 10]), 4);
+        assert_eq!(total_ticks([0, 0, 0], [3, 4, 0]), 5);
+        assert_eq!(total_ticks([0, 0, 0], [0, 0, 0]), 0);
+    }
+
+    #[test]
+    fn the_per_tick_delta_is_the_straight_line_step_and_arrival_ends_it() {
+        assert_eq!(moving_position([0, 0, 0], [4, 0, 0], 0, 4), [0.0, 0.0, 0.0]);
+        assert_eq!(moving_position([0, 0, 0], [4, 0, 0], 4, 4), [4.0, 0.0, 0.0]);
+        assert_eq!(step_delta([0, 0, 0], [4, 0, 0], 4), [1.0, 0.0, 0.0]);
+        assert!(!arrived(3, 4));
+        assert!(!arrived(2, 4));
+        assert!(arrived(4, 4));
+    }
+
+    #[test]
+    fn an_available_mover_has_no_card_and_no_pending_move() {
+        assert!(mover_available(0));
+        assert!(!mover_available(MOVER_HAS_CARD));
+        assert!(!mover_available(MOVER_MOVING));
+        assert!(!mover_available(MOVER_HAS_CARD | MOVER_MOVING));
+    }
+
+    #[test]
+    fn arrival_moves_the_card_from_the_source_to_the_destination() {
+        let (source, dest) = arrival_flags(MOVER_HAS_CARD | MOVER_MOVING, 0);
+        assert_eq!(source, 0);
+        assert_eq!(dest, MOVER_HAS_CARD);
+        // A second arrival over an already-loaded destination is a no-op on its card.
+        let (source, dest) = arrival_flags(MOVER_HAS_CARD, MOVER_HAS_CARD);
+        assert_eq!(source, 0);
+        assert_eq!(dest, MOVER_HAS_CARD);
+    }
+
+    #[test]
+    fn the_mover_readout_names_the_ticks_the_destination_and_the_fee() {
+        assert_eq!(
+            mover_line(&MoverStatus {
+                at: [10, 100, 10],
+                flags: MOVER_MOVING,
+                total: 4,
+                done: 2,
+                dest: [14, 100, 10],
+                delivered: 0,
+                energy: 100_000,
+            }),
+            "Mover at 10 100 10: 2/4 ticks to 14 100 10, delivered 0, 100000/100000 FE"
+        );
+        assert_eq!(
+            controller_line([9, 100, 10], 100_000),
+            "Controller at 9 100 10: 100000/100000 FE, 1000 FE/move"
         );
     }
 }
