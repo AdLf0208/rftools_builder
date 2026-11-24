@@ -58,17 +58,28 @@ A Horizon native mod (mod API 0.2) that ports **RFTools Builder 1.21-7.0.8**
   `/rftoolsbuilder energy <pos>` reads the buffer, lifetime spend and per-cell
   costs back; `/rftoolsbuilder charge <pos> <amount>` fills it through the block's
   energy capability (a harness stand-in for a cable).
+- **The filter module and filtered placement**: `/rftoolsbuilder filter <block|tag>
+  <allow|deny>` authors a filter on the held card. A `#tag` value matches any block
+  in that tag, a bare value matches the block id; `allow` (the jar's `blacklist =
+  false`) builds only matching cells, `deny` (`blacklist = true`) skips them. A
+  filtered-out cell is charged the jar's `builderRfPerSkipped` 50 FE and is never
+  built, exactly as `BuilderTileEntity` consumes that cost before `skip(data)`.
+  `filter none` clears it (the jar's empty filter slot). The container declares
+  the jar's second slot, `SLOT_FILTER`; this package's filter rides the card's
+  data component rather than a separate filter-module item.
 - **`/rftoolsbuilder status <pos>`** reads a Builder out: its card type, shape,
   size, offset, cell count, the replacement block, the void list, progress, and
-  the first cell it refused and why.
+  the first cell it refused and why; `/rftoolsbuilder energy <pos>` also reports
+  the FE spent on filtered-out cells.
 - The card goes into the Builder's card slot on a right click; an empty hand
   reads the Builder out; a sneaking empty hand takes the card back.
 
 ## What it does not do
 
 The movers and their controls, the shields, the space chamber, the composer, the
-projector, the scanner, the GUI screens, the liquid/pump cards and the filter
-module are **not** carried. The per-block hardness multiplier, card-type cost
+projector, the scanner, the GUI screens and the liquid/pump cards are **not**
+carried. The filter's multi-entry GUI is replaced by the single-entry
+`/rftoolsbuilder filter` command. The per-block hardness multiplier, card-type cost
 factors beyond the void card, and the infuser itself are also out of scope: the
 port charges the jar's base per-cell cost. The `GAPS` list in `notes.md` names
 each with the upstream file that implements it.

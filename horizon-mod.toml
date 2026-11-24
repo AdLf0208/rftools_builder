@@ -1,6 +1,6 @@
 id = "rftoolsbuilder"
 name = "RFTools Builder"
-version = "0.2.6"
+version = "0.2.7"
 description = """RFTools Builder for Horizon: the Builder block and its shape cards. A card carries a
 shape (box, sphere, cylinder, capped cylinder, prism, cone, top and bottom dome, torus, heart) or
 one of the quarry card types (normal, silk touch, fortune, and their clearing variants) or the void
@@ -12,10 +12,12 @@ the card clears), at the jar's eight cells a tick. A quarry card's void list rem
 collecting them, and the Builder's replacement block is settable. A quarry card registers its own
 ticket controller and force-loads the unloaded chunk it is quarrying, releasing the ticket when the
 pass ends. The Builder holds an FE buffer and pays the jar's base cost per acted cell (500 build,
-300 quarry, 250 void), suspending with 'not enough power' when it cannot pay. /rftoolsbuilder status
-reads a Builder's card, replacement and progress back, /rftoolsbuilder energy reads its buffer and
-spend, /rftoolsbuilder charge fills it, and /rftoolsbuilder forced reads the chunks its ticket holds.
-The movers, shields, space chamber, composer, projector and scanner are not carried."""
+300 quarry, 250 void), suspending with 'not enough power' when it cannot pay. A filter can allow or
+deny a block id or tag: a filtered-out cell costs the jar's builderRfPerSkipped 50 FE and is never
+built. /rftoolsbuilder status reads a Builder's card, replacement and progress back, /rftoolsbuilder
+energy reads its buffer and spend, /rftoolsbuilder charge fills it, /rftoolsbuilder filter authors
+the filter, and /rftoolsbuilder forced reads the chunks its ticket holds. The movers, shields, space
+chamber, composer, projector and scanner are not carried."""
 authors = ["McJty"]
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins,
 # beside data/ and assets/. The id is the resource namespace and the only identity: Cargo's

@@ -24,9 +24,10 @@ use mod_api::{
 
 use crate::runtime::{
     self, BLOCKS_PER_TICK, BUILDER_CELLS, Card, CardKind, CellCharge, CellFacts, DONT_REMOVE_ME,
-    ENERGY_CAPACITY, ENERGY_MAX_INSERT, EnergyStatus, FORTUNE_LEVEL, INFUSION_FACTOR,
-    LOOKUPS_PER_TICK, Progress, QUARRY_REPLACE, QUARRY_TOOL, Quarry, QuarryStep, Refusal,
-    RefusalReason, Scan, Shape, Status, Voiding, adjusted_cost, cell_cost, energy_line,
+    ENERGY_CAPACITY, ENERGY_MAX_INSERT, EnergyStatus, FORTUNE_LEVEL, Filter, FilterMode,
+    INFUSION_FACTOR, LOOKUPS_PER_TICK, Progress, QUARRY_REPLACE, QUARRY_TOOL, Quarry, QuarryStep,
+    Refusal, RefusalReason, Scan, Shape, Status, Voiding, adjusted_cost, cell_cost, energy_line,
+    filter_match, filter_skip_cost,
 };
 
 /// The compound key type, taken from `Tag::String`'s own payload: the API does not re-export the
@@ -51,9 +52,12 @@ const CARD_ITEM: &str = runtime::SHAPE_CARD;
 pub(crate) const COMPONENT: &str = runtime::COMPONENT;
 /// The card slot of the Builder's container (`BuilderTileEntity.SLOT_TAB`).
 const SLOT_CARD: usize = 0;
-/// The container's slot count. Upstream also has a filter slot (slot 1); the
-/// filter module is not carried, so the slot is not declared (notes.md).
-const CARD_SLOTS: usize = 1;
+/// The Builder's filter slot (`BuilderTileEntity.SLOT_FILTER`). The jar carries a separate
+/// filter-module item here; this port's filter rides the card's component (recorded deviation),
+/// but the slot is declared so the container has the jar's two slots.
+const SLOT_FILTER: usize = 1;
+/// The container's slot count: the card and the filter slot.
+const CARD_SLOTS: usize = SLOT_FILTER + 1;
 
 // --- card component keys (upstream's `ShapeCardData` field names) ----------
 /// `ShapeCardData.shape`: the jar's shape enum name.
@@ -83,6 +87,10 @@ const K_TYPE: &str = "type";
 const K_TAG_MATCHING: &str = "tagMatching";
 /// `ShapeCardData.voiding`: the material keys the card's quarry collects nothing for.
 const K_VOIDING: &str = "voiding";
+/// The filter's configured value (a block id or a `#tag`) — `/rftoolsbuilder filter`.
+const K_FILTER_VALUE: &str = "filterValue";
+/// The filter's mode (`blacklist`): `allow` or `deny`.
+const K_FILTER_MODE: &str = "filterMode";
 
 // --- block-entity keys -----------------------------------------------------
 /// The walking cursor; absent while there is no pass to resume.
@@ -127,6 +135,8 @@ const K_FORCED_CHUNK: &str = "forcedChunk";
 const K_ENERGY: &str = "energy";
 /// FE this Builder's passes have spent, so `/rftoolsbuilder energy` can report exact consumption.
 const K_ENERGY_SPENT: &str = "energySpent";
+/// FE spent specifically on filtered-out cells (`builderRfPerSkipped`).
+const K_FILTER_SPENT: &str = "filterSpent";
 
 /// The card's refusal codes in the saved compound.
 const REFUSAL_NONE: i8 = 0;
@@ -186,7 +196,7 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
         .expect("one Part per block-entity type");
     // The card is both put in and taken out by hand, as upstream's card slot
     // is `in().out()`.
-    let slots: Vec<usize> = (0..CARD_SLOTS).collect();
+    let slots: Vec<usize> = vec![SLOT_CARD, SLOT_FILTER];
     // `..Default::default()` keeps a field a later game build adds from breaking
     // this literal (`cargo horizon-mod check` asks for it).
     #[expect(
@@ -283,6 +293,8 @@ impl Component for CardTag {
 struct CardData {
     card: Card,
     selection: Selection,
+    /// The filter the jar keeps in the filter module's data component (here on the card).
+    filter: Filter,
 }
 
 /// The corner-selection state upstream keeps in `ShapeCardDimensions`
@@ -307,6 +319,7 @@ impl CardData {
         Self {
             card: card_of(&data),
             selection: selection_of(&data),
+            filter: filter_of(&data),
         }
     }
 
@@ -316,6 +329,7 @@ impl CardData {
         let mut data = Compound::new();
         put_card(&mut data, self.card);
         put_selection(&mut data, &self.selection);
+        put_filter(&mut data, &self.filter);
         stack.set(&CardTag, Tag::Compound(data)).is_ok()
     }
 }
@@ -395,6 +409,29 @@ fn put_card(data: &mut Compound, card: Card) {
     data.insert(key!(K_VOIDING), Tag::List(voiding));
 }
 
+/// The filter a card's data compound carries: the `blacklist` mode and the single configured
+/// value (a block id or a `#tag`). Absent fields are the jar's "no filter in slot 1".
+fn filter_of(data: &Compound) -> Filter {
+    Filter {
+        mode: string(data, K_FILTER_MODE)
+            .and_then(|mode| FilterMode::parse(&mode))
+            .unwrap_or_default(),
+        value: string(data, K_FILTER_VALUE).unwrap_or_default(),
+    }
+}
+
+/// Write a filter's fields into a card's data compound.
+fn put_filter(data: &mut Compound, filter: &Filter) {
+    data.insert(
+        key!(K_FILTER_VALUE),
+        Tag::String(filter.value.as_str().into()),
+    );
+    data.insert(
+        key!(K_FILTER_MODE),
+        Tag::String(filter.mode.as_str().into()),
+    );
+}
+
 /// The card in the Builder's slot, as its saved compound holds it: the item id and the card's own
 /// data, which is everything the stack's component carried.
 fn saved_card(data: &Compound) -> Option<(String, CardData)> {
@@ -407,6 +444,7 @@ fn saved_card(data: &Compound) -> Option<(String, CardData)> {
         CardData {
             card: card_of(card),
             selection: selection_of(card),
+            filter: filter_of(card),
         },
     ))
 }
@@ -419,6 +457,7 @@ fn write_saved_card(data: &mut Compound, card: Option<(&str, &CardData)>) {
             let mut fields = Compound::new();
             put_card(&mut fields, payload.card);
             put_selection(&mut fields, &payload.selection);
+            put_filter(&mut fields, &payload.filter);
             data.insert(key!(K_CARD_DATA), Tag::Compound(fields));
         }
         None => {
@@ -567,6 +606,8 @@ struct State {
     /// FE this Builder's passes have spent, as the jar's `GenericEnergyStorage` consumption
     /// accumulated (the port keeps a lifetime total for the energy readout).
     energy_spent: u64,
+    /// FE spent on filtered-out cells, read by `/rftoolsbuilder energy` as `M × 50`.
+    filter_skipped: u64,
 }
 
 impl State {
@@ -610,6 +651,7 @@ impl State {
             }),
             forced_chunk: ints2(nbt, K_FORCED_CHUNK),
             energy_spent: number(K_ENERGY_SPENT).unwrap_or(0),
+            filter_skipped: number(K_FILTER_SPENT).unwrap_or(0),
         }
     }
 
@@ -685,6 +727,10 @@ impl State {
             key!(K_ENERGY_SPENT),
             Tag::Long(i64::try_from(self.energy_spent).unwrap_or(i64::MAX)),
         );
+        nbt.insert(
+            key!(K_FILTER_SPENT),
+            Tag::Long(i64::try_from(self.filter_skipped).unwrap_or(i64::MAX)),
+        );
     }
 }
 
@@ -713,6 +759,19 @@ fn spend(nbt: &mut Compound, spent: &mut u64, base: u32) -> bool {
     set_energy(nbt, held - cost);
     *spent += u64::from(cost);
     true
+}
+
+/// Charge a filtered-out cell the jar's `builderRfPerSkipped`. Upstream calls
+/// `consumeEnergy(min(energyStored, builderRfPerSkipped))` and never suspends on a skip, so this
+/// drains what the buffer holds (at most 50 FE) and records it apart from the build/quarry spend.
+fn spend_skip(nbt: &mut Compound, spent: &mut u64, filter_skipped: &mut u64) {
+    let paid = energy_of(nbt).min(filter_skip_cost());
+    if paid == 0 {
+        return;
+    }
+    set_energy(nbt, energy_of(nbt) - paid);
+    *spent += u64::from(paid);
+    *filter_skipped += u64::from(paid);
 }
 
 // ---------------------------------------------------------------------------
@@ -757,7 +816,9 @@ fn sync_card(
             Some(stack) => event.entity.items = vec![Some(stack)],
             None => event.entity.items = vec![None],
         }
-        event.entity.items.resize(SLOT_CARD + 1, None);
+        // The filter slot (SLOT_FILTER) stays empty in this port — the filter rides the card
+        // component — but the container must still expose both of the jar's slots.
+        event.entity.items.resize(CARD_SLOTS, None);
         changed = true;
     }
     let shown_now = saved.as_ref().map(|(item, _)| item.clone());
@@ -822,6 +883,10 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
     // outside (a click that has not been read back yet) and wins.
     let mirrored = sync_card(host, event);
     let card = mirrored.as_ref().map(|(_, payload)| payload.card);
+    let filter = mirrored
+        .as_ref()
+        .map(|(_, payload)| payload.filter.clone())
+        .unwrap_or_default();
     let before = State::read(&event.entity.nbt);
     let mut state = before.clone();
 
@@ -866,7 +931,10 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
     // One pass per card (notes.md, deviation 1): a card that is not the one
     // this pass belongs to starts a fresh pass at the top of the low corner,
     // and a finished pass stays finished until the card changes.
-    let fingerprint = fingerprint(card, &replace);
+    let mut fingerprint = fingerprint(card, &replace);
+    // Editing the filter is a new job, like editing the card: the pass restarts so an already
+    // finished Builder rebuilds under the new allow/deny rule.
+    fingerprint.push_str(&format!("|{}-{}", filter.value, filter.mode.as_str()));
     if state.card.as_deref() != Some(fingerprint.as_str()) {
         // A new card (or a changed replacement) is the jar's `restartScan`, which starts by
         // releasing the chunk the previous pass held.
@@ -995,7 +1063,32 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
                 });
                 break;
             }
-            if is_replaceable(host, level, cursor) {
+            // The filter module: upstream tests `filterCache.test(Block.getCloneItemStack(…))`
+            // and, when it is false, consumes `builderRfPerSkipped` and calls `skip(data)` — the
+            // cell is never built. A block's id is its clone item for the blocks this package
+            // carries; a `#tag` value is checked against the host's block tag table.
+            let passes = if filter.is_empty() {
+                true
+            } else {
+                match level.block(host, cursor) {
+                    Some(block) => {
+                        let id = block.id(&*host);
+                        filter_match(&filter, &id, |_id, tag| {
+                            host.block_in_tag(block, tag).unwrap_or(false)
+                        })
+                    }
+                    None => true,
+                }
+            };
+            if !passes {
+                spend_skip(
+                    &mut event.entity.nbt,
+                    &mut state.energy_spent,
+                    &mut state.filter_skipped,
+                );
+                state.progress.skipped += 1;
+                state.refusal = None;
+            } else if is_replaceable(host, level, cursor) {
                 match place(
                     host,
                     level,
@@ -1805,6 +1898,14 @@ pub(crate) fn on_register_commands(event: &mut RegisterCommandsEvent<'_>) {
         .commands
         .push(Command::new("rftoolsbuilder tagmatching <mode:word>"));
     event.commands.push(Command::new(
+        "rftoolsbuilder filter <value:resource:minecraft:block> <mode:word>",
+    ));
+    // The resource argument cannot spell "none" (it must name a block), so clearing the filter
+    // is its own usage. `word` is not usable for a value: brigadier's word parser rejects `:`.
+    event
+        .commands
+        .push(Command::new("rftoolsbuilder filter none"));
+    event.commands.push(Command::new(
         "rftoolsbuilder replace <pos:block_pos> <block:resource:minecraft:block>",
     ));
 }
@@ -1906,6 +2007,11 @@ pub(crate) fn on_run_mod_command(
             feedback(host, &line);
             Flow::Cancel
         }
+        "filter" => {
+            let line = write_filter(host, event);
+            feedback(host, &line);
+            Flow::Cancel
+        }
         "replace" => {
             let line = write_replace(host, event);
             feedback(host, &line);
@@ -1993,6 +2099,45 @@ fn write_tag_matching(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>)
     with_held_card(host, |data| {
         data.card.tag_matching = mode;
         format!("Card tag matching {}", if mode { "on" } else { "off" })
+    })
+    .unwrap_or_else(|| "Hold a shape card in your main hand".to_owned())
+}
+
+/// `/rftoolsbuilder filter <block|tag> <allow|deny>`: author the filter module's data on the held
+/// card. A value starting with `#` names a block tag, anything else a block id. `allow` is the
+/// jar's `blacklist = false` (only the value passes), `deny` its `blacklist = true` (the value is
+/// skipped). `none` clears the filter (the jar's empty slot 1).
+fn write_filter(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> String {
+    // `/rftoolsbuilder filter none` (no `value` argument) clears the filter. A real value is a
+    // resource id (`minecraft:stone`) or a `#tag`; `word` cannot carry the `:`.
+    let value = match event.command.argument("value") {
+        None => {
+            return with_held_card(host, |data| {
+                data.filter = Filter::default();
+                "Card filter cleared".to_owned()
+            })
+            .unwrap_or_else(|| "Hold a shape card in your main hand".to_owned());
+        }
+        Some(CommandArgumentValue::Id(id)) => id.to_string(),
+        _ => return "usage: /rftoolsbuilder filter <block|tag> <allow|deny>".to_owned(),
+    };
+    let Some(CommandArgumentValue::String(word)) = event.command.argument("mode") else {
+        return "usage: /rftoolsbuilder filter <block|tag> <allow|deny>".to_owned();
+    };
+    let Some(mode) = FilterMode::parse(word) else {
+        return format!("unknown filter mode '{word}'; try allow or deny");
+    };
+    with_held_card(host, |data| {
+        if value.eq_ignore_ascii_case("none") {
+            data.filter = Filter::default();
+            "Card filter cleared".to_owned()
+        } else {
+            data.filter = Filter {
+                mode,
+                value: value.clone(),
+            };
+            format!("Card filters {} blocks ({})", value, mode.as_str())
+        }
     })
     .unwrap_or_else(|| "Hold a shape card in your main hand".to_owned())
 }
@@ -2177,10 +2322,12 @@ fn energy_at(host: &dyn Host, pos: [i32; 3]) -> String {
     let saved = entity_at(host, pos)
         .and_then(|entity| entity.data(host))
         .unwrap_or_default();
+    let state = State::read(&saved);
     energy_line(&EnergyStatus {
         at: pos,
         stored: energy_of(&saved),
-        spent: State::read(&saved).energy_spent,
+        spent: state.energy_spent,
+        filter_skipped: state.filter_skipped,
     })
 }
 
@@ -2361,6 +2508,10 @@ mod tests {
                 target: Some(("minecraft:overworld".to_owned(), [10, 64, 10])),
                 corner1: Some([1, 2, 3]),
             },
+            filter: Filter {
+                mode: FilterMode::Deny,
+                value: "#c:stones".to_owned(),
+            },
         };
         let mut data = Compound::new();
         write_saved_card(&mut data, Some(("rftoolsbuilder:shape_card_def", &payload)));
@@ -2396,6 +2547,7 @@ mod tests {
             }),
             forced_chunk: Some([3, -1]),
             energy_spent: 8_100,
+            filter_skipped: 300,
         };
         let mut nbt = Compound::new();
         state.write(&mut nbt);

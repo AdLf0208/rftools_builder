@@ -41,7 +41,11 @@
 #       difference between the two outcomes;
 #   14. the Builder's loot table drops it when broken with an iron pickaxe;
 #   15. `/rftoolsbuilder reset` returns the held card to the jar's default solid
-#       5x5x5 box, read back with `status` as 125 cells.
+#       5x5x5 box, read back with `status` as 125 cells;
+#   16. the FILTER module: `/rftoolsbuilder filter minecraft:stone deny` on a shape
+#       card over a 27-cell mixed stone/air box skips the 18 stone cells and charges the
+#       jar's builderRfPerSkipped 50 FE each (900 FE), status reads `9 placed, 18 skipped`,
+#       while the same box with `filter none` spends 0 skip FE.
 #
 # COUNTERFACTUAL=1 puts a vanilla furnace where the Builder goes: the card's
 # `/rftoolsbuilder shape` still writes, but `status` says `not a builder` and
@@ -54,7 +58,8 @@
 # where the pass writes dirt), so that run MUST end in `FAIL:` too. SELFTEST=void
 # flips the void card's "chest unchanged" assertion to "one cobblestone collected",
 # so that run MUST end in `FAIL:` too. SELFTEST=energy expects 8101 rather than 8100
-# FE spent by a 27-cell quarry, so that run MUST end in `FAIL:` too.
+# FE spent by a 27-cell quarry, so that run MUST end in `FAIL:` too. SELFTEST=filter
+# expects 17 skipped cells where the filter skips 18, so that run MUST end in `FAIL:`.
 #
 # The mod is one flat `.hmod` the launcher compiles into the game, so GAME must
 # name a game the launcher built with it. The Builder's recipe needs
@@ -135,6 +140,7 @@ energy() { # energy X Y Z
 }
 energy_of() { sed -nE 's/.*energy ([0-9]+)\/[0-9]+ FE.*/\1/p' <<<"$1"; }
 spent_of() { sed -nE 's/.*spent ([0-9]+) FE.*/\1/p' <<<"$1"; }
+filter_spent_of() { sed -nE 's/.*filter skipped ([0-9]+) FE.*/\1/p' <<<"$1"; }
 # The command's answer, from chat, without the colour prefix.
 # The command's own answer: the newest chat line that reads as one (the buffer also holds the
 # scenario's earlier replies, so the *last* match is the answer to this command).
@@ -163,7 +169,7 @@ answer() {
     local i out=""
     for i in 1 2 3 4 5; do
         mod "$@"
-        out=$(ctl messages 20 | jq -r '.chat[]' | grep -E '^(Card set to|Card offset set to|Card type set to|Card voids|Card void list cleared|Card tag matching|Builder replacement set to|Card reset|Hold a shape card|Unknown|unknown card type|unknown material|usage:|the last argument|not a builder)' | head -1 || true)
+        out=$(ctl messages 20 | jq -r '.chat[]' | grep -E '^(Card set to|Card offset set to|Card type set to|Card voids|Card void list cleared|Card tag matching|Card filters|Card filter cleared|Builder replacement set to|Card reset|Hold a shape card|Unknown|unknown card type|unknown filter mode|unknown material|usage:|the last argument|not a builder)' | head -1 || true)
         if [ -n "$out" ]; then
             echo "$out"
             return 0
@@ -415,9 +421,9 @@ echo "status: $line; stone cells: $built"
 # and the three numbers must add up to the shape — the invariant, not just the three values.
 expected=24
 [ "$SELFTEST" = 1 ] && expected=25
-# The finished readout prints the placed count and "scan complete" (the skipped count is only named
-# while a pass is still running), so the world count and the chest are what pin the three cells.
-echo "$line" | grep -q "27 cells, 24 placed, scan complete" || fail "unexpected progress: $line"
+# The finished readout prints the placed count, the nonzero skipped count and "scan complete", so
+# the world count and the chest are what pin the three cells.
+echo "$line" | grep -q "27 cells, 24 placed, 3 skipped, scan complete" || fail "unexpected progress: $line"
 [ "$built" -eq "$expected" ] || fail "built $built cells, expected $expected"
 [ "$((built + 3))" -eq 27 ] || fail "the box's 27 cells are not 24 stone + 3 that cannot take one"
 left=$(chest_stone)
@@ -456,7 +462,7 @@ echo "$line" | grep -q "Box (Hollow) 5x5x5 offset 0 2 0, 98 cells" || fail "unex
 # there, so 92 are built and the chest must lose exactly 92. (Measured with the box NOT lifted: 73 =
 # 98 - 25, the arena platform's 25 stone cells forming the shell's bottom face.) A walk that
 # under-visits lands below 92 and fails here.
-echo "$line" | grep -q "98 cells, 92 placed, scan complete" || fail "the shell is not complete: $line"
+echo "$line" | grep -q "98 cells, 92 placed, 6 skipped, scan complete" || fail "the shell is not complete: $line"
 chest_after=$(chest_stone)
 [ "$((chest_full - chest_after))" -eq 92 ] \
     || fail "the shell took $((chest_full - chest_after)) blocks, expected 92"
@@ -589,6 +595,10 @@ quarry_rig() {
     # (two z cells: a negative `z.5` teleport floors to the block below, not the one named).
     ctl setblock "$QX" $((QY - 2)) "$((QZ + 2))" minecraft:stone >/dev/null
     ctl setblock "$QX" $((QY - 2)) "$((QZ + 3))" minecraft:stone >/dev/null
+    # At a negative X the `QX.5` teleport floors into block QX-1 (the block spans QX-1..QX),
+    # so the pad needs the western cell too or the player falls out of click reach.
+    ctl setblock "$((QX - 1))" $((QY - 2)) "$((QZ + 2))" minecraft:stone >/dev/null
+    ctl setblock "$((QX - 1))" $((QY - 2)) "$((QZ + 3))" minecraft:stone >/dev/null
     # The Builder is set in place, as the loot phase does: the item-placement path is the first
     # rig's proof, and this rig's own subject is the card type.
     ctl command "setblock $QX $QY $QZ $BUILDER" >/dev/null 2>&1 || true
@@ -711,7 +721,7 @@ echo "$line" | grep -q "quarry (Normal quarry), replacing with minecraft:dirt, v
     || fail "the card lost its quarry settings when it was moved: $line"
 # The second pass walks the same 27 cells, and every one of them is the replacement block: the
 # non-clearing quarry leaves them alone and collects nothing.
-echo "$line" | grep -q "27 cells, quarry (Normal quarry), replacing with minecraft:dirt, voiding dirt, gravel (tags too), 0 quarried, scan complete" \
+echo "$line" | grep -q "27 cells, quarry (Normal quarry), replacing with minecraft:dirt, voiding dirt, gravel (tags too), 0 quarried, 27 skipped, scan complete" \
     || fail "a quarry over its own replacement block worked: $line"
 [ "$(chest_total "$QX" $((QY + 1)) "$QZ")" -eq 25 ] || fail "the second pass collected something"
 
@@ -940,6 +950,88 @@ volume_all minecraft:stone || fail "the uncharged quarry changed a cell of its v
 
 QX=$o_QX; QZ=$o_QZ; VX1=$o_VX1; VX2=$o_VX2; VZ1=$o_VZ1; VZ2=$o_VZ2
 
+# --- the filter module (slice 7) -------------------------------------------
+# The jar's filter is tested on the block at each scan cell; a non-match consumes
+# `builderRfPerSkipped` (50 FE) and calls `skip(data)` without placing anything. A shaped pass only
+# *places* into replaceable cells, so this rig's 27-cell box is a mix of `minecraft:stone` (the
+# denied cells, skipped and charged) and `minecraft:air` (the allowed, placeable ones). The filter
+# is authored with `/rftoolsbuilder filter <block|tag> <allow|deny>`.
+say "== FILTER: a deny filter skips its block and charges builderRfPerSkipped (50 FE) =="
+o2_QX=$QX; o2_QZ=$QZ
+filter_rig() { # dx dz — a fresh charged Builder and a 27-cell stone/air box
+    QX=$((o2_QX + $1)); QZ=$((o2_QZ + $2))
+    VX1=$((QX + 5)); VX2=$((QX + 7)); VZ1=$((QZ - 1)); VZ2=$((QZ + 1))
+    quarry_rig
+    # A shaped pass needs a supply: the quarry rigs do not fill their chest, so fill this one.
+    for _ in $(seq 1 27); do
+        ctl container "$QX" $((QY + 1)) "$QZ" minecraft:stone 64 >/dev/null 2>&1 || true
+    done
+    # 18 stone cells (the three upper layers, denied by the filter) and 9 air cells (the bottom
+    # layer, allowed and placeable). Both ids are guaranteed at this pin; a `tall_grass` fill
+    # popped to air before the pass, which is why it is not used here.
+    ctl command "fill $VX1 $VY1 $VZ1 $VX2 $VY2 $VZ2 minecraft:stone" >/dev/null
+    ctl command "fill $VX1 $VY1 $VZ1 $VX2 $VY1 $VZ2 minecraft:air" >/dev/null
+    ctl wait 8 >/dev/null
+}
+install_filter_card() { # value mode (value 'none' clears the filter)
+    local value=$1 mode=$2 line
+    ctl command "clear @a" >/dev/null
+    ctl wait 4 >/dev/null
+    ctl give "$CARD" 1 >/dev/null || fail "cannot give a filter card"
+    ctl wait 6 >/dev/null
+    ctl select "$CARD" >/dev/null || fail "cannot select the filter card"
+    ctl wait 6 >/dev/null
+    line=$(answer shape box 3 3 3)
+    echo "$line" | grep -q "Card set to" || fail "the filter card's shape: $line"
+    line=$(answer offset 6 0 0)
+    echo "$line" | grep -q "Card offset set to 6 0 0" || fail "the filter card's offset: $line"
+    if [ "$value" = none ]; then
+        line=$(answer filter none)
+    else
+        line=$(answer filter "$value" "$mode")
+    fi
+    echo "filter command: $line"
+    if [ "$value" = none ]; then
+        echo "$line" | grep -q "Card filter cleared" || fail "the filter was not cleared: $line"
+    else
+        echo "$line" | grep -q "Card filters $value blocks ($mode)" || fail "the filter command: $line"
+    fi
+    install_held_card "Box (Solid) 3x3x3 offset 6 0 0"
+}
+
+filter_rig 12 -12
+line=$(energy "$QX" "$QY" "$QZ")
+echo "filter energy before: $line"
+[ "$(energy_of "$line")" = 1000000 ] || fail "the filter rig did not hold 1000000 FE: $line"
+install_filter_card minecraft:stone deny
+ctl wait 160 >/dev/null
+line=$(status "$QX" "$QY" "$QZ")
+echo "filter status: $line"
+# 9 air cells are allowed and placed; the 18 stone cells are denied, skipped and charged. The
+# SELFTEST inverts only this skip count, so the run MUST fail if the assertion is vacuous.
+expected_skip=18
+[ "$SELFTEST" = filter ] && expected_skip=17
+echo "$line" | grep -q "27 cells, 9 placed, ${expected_skip} skipped, scan complete" \
+    || fail "the filter skipped $(echo "$line" | sed -nE 's/.* ([0-9]+) skipped.*/\1/p') cells; expected $expected_skip"
+line=$(energy "$QX" "$QY" "$QZ")
+echo "filter energy after: $line"
+[ "$(filter_spent_of "$line")" = 900 ] \
+    || fail "the 18 skipped stone cells spent $(filter_spent_of "$line") FE; expected 900 = 18 x 50"
+
+# CONTROL: the same stone/air box with no filter spends nothing on skips.
+filter_rig 16 -16
+install_filter_card none allow
+ctl wait 160 >/dev/null
+line=$(status "$QX" "$QY" "$QZ")
+echo "filter-control status: $line"
+echo "$line" | grep -q "27 cells, .*scan complete" || fail "the control did not finish: $line"
+line=$(energy "$QX" "$QY" "$QZ")
+echo "filter-control energy: $line"
+[ "$(filter_spent_of "$line")" = 0 ] \
+    || fail "the empty filter spent $(filter_spent_of "$line") FE on skips; expected 0"
+
+QX=$o_QX; QZ=$o_QZ; VX1=$o_VX1; VX2=$o_VX2; VZ1=$o_VZ1; VZ2=$o_VZ2
+
 say "the Builder's loot table drops the Builder"
 # `ctl break` mines the way a player does: survival (creative's instant break is not on that path)
 # and far from the world spawn, whose protection refuses a non-op player's break. So the block is
@@ -1001,4 +1093,4 @@ cards=$(count_item "$CARD")
 echo "cards in the inventory after reset: $cards"
 [ "$cards" -eq 1 ] || fail "the reset consumed the card ($cards left)"
 
-echo "PASS: both carried recipes craft in a real crafting table (the shape card from 4 paper, 2 bricks, 1 iron ingot and 2 redstone; the Builder from 4 bricks, an ender pearl, 3 redstone and a machine frame) with their ingredients consumed and their wrong-ingredient controls empty, the game log has no rejected ingredient, the Builder fills its 3x3x3 box from the chest above it (24 placed, 64 -> 40), a hollow 5x5x5 is a 98-cell shell (92 placed against a full chest), a box outside the world border builds 0 and spends nothing, a quarry card over 27 cells breaks them and leaves the configured replacement (25 cobblestone collected, the gravel and the tag-matched coarse dirt voided and not collected), the quarry card keeps its type and void list when it is taken out and put back, tag matching off collects the coarse dirt again, /rftoolsbuilder replace changes the replacement, a void card over 27 stone leaves 27 dirt with 27 quarried and 27 voided and collects nothing while a normal quarry card on the same rig collects all 27, a box card on the same rig collects nothing, a charged quarry's 27 cells spend exactly 8100 FE while a void card's spend 6750 FE and an empty buffer stalls at 0 quarried with 'not enough power', the Builder's loot table drops it, the card goes in, comes back out, resets to the 5x5x5 default, and the placed volume survives a relaunch"
+echo "PASS: both carried recipes craft in a real crafting table (the shape card from 4 paper, 2 bricks, 1 iron ingot and 2 redstone; the Builder from 4 bricks, an ender pearl, 3 redstone and a machine frame) with their ingredients consumed and their wrong-ingredient controls empty, the game log has no rejected ingredient, the Builder fills its 3x3x3 box from the chest above it (24 placed, 64 -> 40), a hollow 5x5x5 is a 98-cell shell (92 placed against a full chest), a box outside the world border builds 0 and spends nothing, a quarry card over 27 cells breaks them and leaves the configured replacement (25 cobblestone collected, the gravel and the tag-matched coarse dirt voided and not collected), the quarry card keeps its type and void list when it is taken out and put back, tag matching off collects the coarse dirt again, /rftoolsbuilder replace changes the replacement, a void card over 27 stone leaves 27 dirt with 27 quarried and 27 voided and collects nothing while a normal quarry card on the same rig collects all 27, a box card on the same rig collects nothing, a charged quarry's 27 cells spend exactly 8100 FE while a void card's spend 6750 FE and an empty buffer stalls at 0 quarried with 'not enough power', the Builder's loot table drops it, the card goes in, comes back out, resets to the 5x5x5 default, the placed volume survives a relaunch, a deny filter skips its 18 stone cells and spends exactly 18 x 50 = 900 FE on them while an empty filter spends 0, and the filter readout is fail-capable"

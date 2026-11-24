@@ -1413,9 +1413,17 @@ pub fn status_line(status: &Status) -> String {
         );
     }
     if status.complete {
+        if status.progress.skipped == 0 {
+            return format!(
+                "{head}, {} {action}{voided}, scan complete",
+                status.progress.placed
+            );
+        }
+        // A filtered-out (or otherwise skipped) cell is named in the finished readout too, so
+        // `/rftoolsbuilder status` answers the exact `N placed, M skipped` the filter proves.
         return format!(
-            "{head}, {} {action}{voided}, scan complete",
-            status.progress.placed
+            "{head}, {} {action}{voided}, {} skipped, scan complete",
+            status.progress.placed, status.progress.skipped
         );
     }
     if status.progress.placed == 0 && status.progress.skipped == 0 && status.progress.voided == 0 {
@@ -1555,6 +1563,9 @@ pub struct EnergyStatus {
     pub stored: u32,
     /// FE spent by this Builder's passes so far (`energySpent`).
     pub spent: u64,
+    /// FE spent specifically on filtered-out cells (`builderRfPerSkipped`), so an in-game
+    /// assertion can read `M × 50` for the skipped cells apart from the build/quarry spend.
+    pub filter_skipped: u64,
 }
 
 /// The parsed energy readout: stored/capacity, lifetime spend, every per-cell cost and the
@@ -1564,7 +1575,7 @@ pub struct EnergyStatus {
 pub fn energy_line(status: &EnergyStatus) -> String {
     let [x, y, z] = status.at;
     format!(
-        "Builder at {x} {y} {z}: energy {}/{} FE, spent {} FE, build {} FE/cell, quarry {} FE/cell, void {} FE/cell, skip {} FE/cell, infusion {}",
+        "Builder at {x} {y} {z}: energy {}/{} FE, spent {} FE, build {} FE/cell, quarry {} FE/cell, void {} FE/cell, skip {} FE/cell, infusion {}, filter skipped {} FE",
         status.stored,
         ENERGY_CAPACITY,
         status.spent,
@@ -1573,7 +1584,93 @@ pub fn energy_line(status: &EnergyStatus) -> String {
         cell_cost(CellCharge::Void),
         cell_cost(CellCharge::Skipped),
         INFUSION_FACTOR as i32,
+        status.filter_skipped,
     )
+}
+
+// ---------------------------------------------------------------------------
+// The filter module (slice 7): filtered placement and the per-skip cost
+// ---------------------------------------------------------------------------
+
+/// The filter's mode, mirroring RFToolsBase's `FilterModuleData.blacklist`: an allow-list
+/// (`false`) passes only the configured ids/tags, a deny-list (`true`) passes everything else.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FilterMode {
+    /// `blacklist = false`: only configured blocks/tags pass; everything else is skipped.
+    #[default]
+    Allow,
+    /// `blacklist = true`: configured blocks/tags are skipped; everything else passes.
+    Deny,
+}
+
+impl FilterMode {
+    /// The word `/rftoolsbuilder filter` reads and `/status` prints.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+
+    /// Parse the jar's `blacklist` word, accepting the player-facing `allow`/`deny` too.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "allow" | "whitelist" | "false" => Some(Self::Allow),
+            "deny" | "blacklist" | "true" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+}
+
+/// A filter configuration: one value (a block id such as `minecraft:stone`, or a `#tag`) and
+/// a mode. The jar's `FilterModuleData` holds lists of item stacks and tags plus `blacklist`;
+/// this port's `/rftoolsbuilder filter` authors one entry per card, which is enough to prove the
+/// allow/deny and id/tag semantics (the multi-entry GUI is not carried — recorded in notes.md).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Filter {
+    /// `blacklist`: allow-list or deny-list.
+    pub mode: FilterMode,
+    /// The configured block id, or a `#`-prefixed block tag. Empty means no filter.
+    pub value: String,
+}
+
+impl Filter {
+    /// Whether the filter is absent: upstream's slot 1 being empty (`getCache` returns null),
+    /// in which case no cell is filtered and the skip cost never fires.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.value.is_empty()
+    }
+}
+
+/// Whether a cell's block passes the filter — the jar's `FilterModuleCache.test(cloneStack)`:
+/// a `#tag` entry matches any block in that tag, a bare entry matches the block id, and the mode
+/// inverts the match for a deny-list. An empty filter passes every block (no predicate in slot 1).
+///
+/// `in_tag` is supplied by the host: a pure closure here keeps this rule unit-testable without
+/// the game (the tag table is the only game-dependent part).
+#[must_use]
+pub fn filter_match(filter: &Filter, block: &str, in_tag: impl Fn(&str, &str) -> bool) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    let matched = match filter.value.strip_prefix('#') {
+        Some(tag) => in_tag(block, tag),
+        None => filter.value == block,
+    };
+    match filter.mode {
+        FilterMode::Allow => matched,
+        FilterMode::Deny => !matched,
+    }
+}
+
+/// The charge for a cell the filter rejected: the jar's `builderRfPerSkipped` (50 FE), consumed
+/// even though nothing was placed (`BuilderTileEntity` consumes it just before `skip(data)`).
+#[must_use]
+pub fn filter_skip_cost() -> u32 {
+    cell_cost(CellCharge::Skipped)
 }
 
 #[cfg(test)]
@@ -2840,11 +2937,77 @@ mod tests {
             at: [22, 102, -7],
             stored: 991_900,
             spent: 8_100,
+            filter_skipped: 0,
         };
         assert_eq!(
             energy_line(&status),
             "Builder at 22 102 -7: energy 991900/1000000 FE, spent 8100 FE, build 500 FE/cell, \
-             quarry 300 FE/cell, void 250 FE/cell, skip 50 FE/cell, infusion 0"
+             quarry 300 FE/cell, void 250 FE/cell, skip 50 FE/cell, infusion 0, filter skipped 0 FE"
         );
+    }
+
+    // --- Slice 7: the filter module and filtered placement ---
+
+    #[test]
+    fn an_allow_filter_passes_only_the_configured_block() {
+        let filter = Filter {
+            mode: FilterMode::Allow,
+            value: "minecraft:stone".to_owned(),
+        };
+        assert!(filter_match(&filter, "minecraft:stone", |_, _| false));
+        assert!(!filter_match(&filter, "minecraft:dirt", |_, _| false));
+        assert!(!filter_match(&filter, "minecraft:cobblestone", |_, _| {
+            false
+        }));
+    }
+
+    #[test]
+    fn a_deny_filter_skips_only_the_configured_block() {
+        let filter = Filter {
+            mode: FilterMode::Deny,
+            value: "minecraft:dirt".to_owned(),
+        };
+        assert!(!filter_match(&filter, "minecraft:dirt", |_, _| false));
+        assert!(filter_match(&filter, "minecraft:stone", |_, _| false));
+    }
+
+    #[test]
+    fn a_tag_filter_matches_only_blocks_in_the_tag() {
+        let filter = Filter {
+            mode: FilterMode::Allow,
+            value: "#c:stones".to_owned(),
+        };
+        let in_stones = |block: &str, tag: &str| {
+            tag == "c:stones" && matches!(block, "minecraft:stone" | "minecraft:cobblestone")
+        };
+        assert!(filter_match(&filter, "minecraft:stone", in_stones));
+        assert!(filter_match(&filter, "minecraft:cobblestone", in_stones));
+        assert!(!filter_match(&filter, "minecraft:dirt", in_stones));
+        // A deny filter over the same tag rejects its members and keeps the rest.
+        let deny = Filter {
+            mode: FilterMode::Deny,
+            value: "#c:stones".to_owned(),
+        };
+        assert!(!filter_match(&deny, "minecraft:stone", in_stones));
+        assert!(filter_match(&deny, "minecraft:dirt", in_stones));
+    }
+
+    #[test]
+    fn an_empty_filter_passes_every_block_in_both_modes() {
+        for mode in [FilterMode::Allow, FilterMode::Deny] {
+            let filter = Filter {
+                mode,
+                value: String::new(),
+            };
+            assert!(filter.is_empty());
+            assert!(filter_match(&filter, "minecraft:stone", |_, _| false));
+            assert!(filter_match(&filter, "minecraft:dirt", |_, _| false));
+        }
+    }
+
+    #[test]
+    fn a_filtered_out_cell_costs_the_jars_builder_rf_per_skipped() {
+        assert_eq!(filter_skip_cost(), 50);
+        assert_eq!(filter_skip_cost(), cell_cost(CellCharge::Skipped));
     }
 }
