@@ -252,6 +252,9 @@ pub struct CellFacts {
     pub is_replacement: bool,
     /// The block is on the card's void list.
     pub voided: bool,
+    /// The card's filter accepts this block (`FilterModuleCache.test` on its clone stack).
+    /// `true` for no filter, as upstream's empty filter slot 1 has no predicate.
+    pub filter_passes: bool,
 }
 
 /// What the quarry does at one cell.
@@ -277,6 +280,9 @@ pub enum SkipReason {
     Unbreakable,
     /// The block is already the replacement block, and the card is not clearing.
     Replacement,
+    /// The card's filter rejected the block (`FilterModuleCache.test` was false): the cell is
+    /// skipped, charged `builderRfPerSkipped`, and its drops are never rolled.
+    Filtered,
 }
 
 /// One shape card's parameters: the subset of upstream's `ShapeCardData` that
@@ -643,6 +649,12 @@ pub fn quarry_step(quarry: Quarry, facts: CellFacts) -> QuarryStep {
     }
     if !quarry.clearing && facts.is_replacement {
         return QuarryStep::Skip(SkipReason::Replacement);
+    }
+    // The filter module is consulted in **both** paths (`commonQuarryBlock` bytecode 298..351,
+    // after `allowedToBreak`, before the void list and the drop roll): a rejected block is
+    // skipped without being broken or handing out drops, and the glue charges 50 FE for it.
+    if !facts.filter_passes {
+        return QuarryStep::Skip(SkipReason::Filtered);
     }
     // `CARD_VOID`'s `voidBlock` — every breakable cell goes down the same no-drops path the
     // quarry's void list uses; no per-material list is consulted for this type.
@@ -2461,6 +2473,7 @@ mod tests {
             destroy_speed,
             is_replacement,
             voided,
+            filter_passes: true,
         };
         // The jar's order: the Builder's own 3x3x3, then air, then an unbreakable block,
         // then the replacement block (a non-clearing card only), then the void list.
@@ -2510,6 +2523,117 @@ mod tests {
     }
 
     #[test]
+    fn a_quarry_cell_the_filter_denies_is_skipped_before_any_drop() {
+        let normal = QUARRY_TYPES[0].1;
+        let facts = |filter_passes| CellFacts {
+            near_builder: false,
+            air: false,
+            destroy_speed: 2.0,
+            is_replacement: false,
+            voided: false,
+            filter_passes,
+        };
+        // `commonQuarryBlock` tests `filterCache` on the clone stack after its own early
+        // guards (bytecode 298..351); a rejected block is `skip(data)` — it stays in place
+        // and no drops are rolled. An accepted one harvests as before.
+        assert_eq!(
+            quarry_step(normal, facts(false)),
+            QuarryStep::Skip(SkipReason::Filtered)
+        );
+        assert_eq!(quarry_step(normal, facts(true)), QuarryStep::Harvest);
+        // The Builder's own box is checked before the filter.
+        assert_eq!(
+            quarry_step(
+                normal,
+                CellFacts {
+                    near_builder: true,
+                    ..facts(false)
+                }
+            ),
+            QuarryStep::Skip(SkipReason::NearBuilder)
+        );
+    }
+
+    #[test]
+    fn the_quarry_filter_runs_before_the_void_path_and_the_drops() {
+        let normal = QUARRY_TYPES[0].1;
+        let facts = CellFacts {
+            near_builder: false,
+            air: false,
+            destroy_speed: 2.0,
+            is_replacement: false,
+            voided: true,
+            filter_passes: false,
+        };
+        // Bytecode order: filterCache.test at 298..351, cachedVoidableBlocks at 385, then the
+        // drop roll. A denied block is skipped — never voided, and never handing out drops.
+        assert_eq!(
+            quarry_step(normal, facts),
+            QuarryStep::Skip(SkipReason::Filtered)
+        );
+        assert_eq!(
+            quarry_step(
+                normal,
+                CellFacts {
+                    filter_passes: true,
+                    ..facts
+                }
+            ),
+            QuarryStep::Void,
+            "the void list still applies once the filter accepts the block"
+        );
+    }
+
+    #[test]
+    fn the_proved_filter_rule_decides_the_quarry_path_by_id_and_tag() {
+        let deny_stone = Filter {
+            mode: FilterMode::Deny,
+            value: "minecraft:stone".to_owned(),
+        };
+        let base = CellFacts {
+            near_builder: false,
+            air: false,
+            destroy_speed: 2.0,
+            is_replacement: false,
+            voided: false,
+            filter_passes: true,
+        };
+        let decide = |filter_passes| {
+            quarry_step(
+                QUARRY_TYPES[0].1,
+                CellFacts {
+                    filter_passes,
+                    ..base
+                },
+            )
+        };
+        let id_passes = |block: &str| filter_match(&deny_stone, block, |_id, _tag| false);
+        assert_eq!(
+            decide(id_passes("minecraft:stone")),
+            QuarryStep::Skip(SkipReason::Filtered)
+        );
+        assert_eq!(decide(id_passes("minecraft:dirt")), QuarryStep::Harvest);
+        // A `#tag` value denies its members too: this needs a tag filter, not the id filter above.
+        let deny_stones = Filter {
+            mode: FilterMode::Deny,
+            value: "#minecraft:stones".to_owned(),
+        };
+        let tag_passes = filter_match(&deny_stones, "minecraft:cobblestone", |_id, tag| {
+            tag == "minecraft:stones"
+        });
+        assert_eq!(
+            decide(tag_passes),
+            QuarryStep::Skip(SkipReason::Filtered),
+            "a denied tag rejects its members too"
+        );
+        assert_eq!(
+            filter_skip_cost(),
+            50,
+            "the quarry skip charges the jar's builderRfPerSkipped, as the shaped path does"
+        );
+    }
+
+    #[test]
     fn the_void_card_is_the_jars_seventh_card_type() {
         // `ShapeCardType.CARD_VOID` (branch 1.21_neo @ 409049466): resourceSuffix `void`,
         // quarry=false, clearing=false, fortune=false, SingleBlockHandler `voidBlock`, HUD
@@ -2540,6 +2664,7 @@ mod tests {
             destroy_speed,
             is_replacement,
             voided: false,
+            filter_passes: true,
         };
         // The jar's voidBlock keeps the same early guards as the quarry: its own 3x3x3, air,
         // an unbreakable block and the replacement it left on a previous pass.

@@ -45,7 +45,12 @@
 #   16. the FILTER module: `/rftoolsbuilder filter minecraft:stone deny` on a shape
 #       card over a 27-cell mixed stone/air box skips the 18 stone cells and charges the
 #       jar's builderRfPerSkipped 50 FE each (900 FE), status reads `9 placed, 18 skipped`,
-#       while the same box with `filter none` spends 0 skip FE.
+#       while the same box with `filter none` spends 0 skip FE;
+#   17. the quarry's FILTER path: the same deny filter on a quarry card over a 27-cell
+#       mixed stone/dirt box skips the 18 denied stone cells (charged 50 FE each), the
+#       9 allowed dirt cells are quarried, the chest holds only their 9 dirt drops and
+#       never the denied stone's cobblestone, while a filterless quarry on the same rig
+#       collects all 27.
 #
 # COUNTERFACTUAL=1 puts a vanilla furnace where the Builder goes: the card's
 # `/rftoolsbuilder shape` still writes, but `status` says `not a builder` and
@@ -60,6 +65,8 @@
 # so that run MUST end in `FAIL:` too. SELFTEST=energy expects 8101 rather than 8100
 # FE spent by a 27-cell quarry, so that run MUST end in `FAIL:` too. SELFTEST=filter
 # expects 17 skipped cells where the filter skips 18, so that run MUST end in `FAIL:`.
+# SELFTEST=filterquarry expects 17 skipped quarry cells where the pass skips 18, so that
+# run MUST end in `FAIL:` too.
 #
 # The mod is one flat `.hmod` the launcher compiles into the game, so GAME must
 # name a game the launcher built with it. The Builder's recipe needs
@@ -1032,6 +1039,108 @@ echo "filter-control energy: $line"
 
 QX=$o_QX; QZ=$o_QZ; VX1=$o_VX1; VX2=$o_VX2; VZ1=$o_VZ1; VZ2=$o_VZ2
 
+# --- the quarry's filter path (slice 8) -------------------------------------
+# `commonQuarryBlock` consults the same FilterModuleCache as the shaped path (bytecode 298..351):
+# on a rejected clone stack it consumes min(energy, builderRfPerSkipped) and calls skip(data) —
+# the block is NOT broken and NO drops are collected. A fresh 27-cell box of 18 stone (denied)
+# and 9 dirt (allowed) proves both halves: the readout's skip count and 50 FE per skip, and the
+# chest holding only the allowed cells' dirt, never the denied stone's cobblestone. The
+# filterless differential on the same rig collects all 27.
+say "== QUARRY FILTER: a deny filter skips its stone cells without collecting their drops =="
+o3_QX=$QX; o3_QZ=$QZ
+fill_quarry_filter_volume() { # 18 stone cells above 9 dirt cells
+    ctl command "fill $VX1 $VY1 $VZ1 $VX2 $VY2 $VZ2 minecraft:dirt" >/dev/null
+    ctl command "fill $VX1 $((VY1 + 1)) $VZ1 $VX2 $VY2 $VZ2 minecraft:stone" >/dev/null
+    ctl wait 8 >/dev/null
+}
+quarry_filter_rig() { # dx dz — a fresh charged Builder over the mixed box
+    QX=$((o3_QX + $1)); QZ=$((o3_QZ + $2))
+    VX1=$((QX + 5)); VX2=$((QX + 7)); VZ1=$((QZ - 1)); VZ2=$((QZ + 1))
+    quarry_rig
+    fill_quarry_filter_volume
+}
+# A quarry card whose filter is authored before the click that installs it.
+install_filtered_quarry_card() { # value mode
+    local value=$1 mode=$2 line
+    ctl command "clear @a" >/dev/null; ctl wait 4 >/dev/null
+    ctl give "$CARD" 1 >/dev/null || fail "cannot give a filtered quarry card"
+    ctl wait 6 >/dev/null
+    ctl select "$CARD" >/dev/null || fail "cannot select the filtered quarry card"
+    ctl wait 6 >/dev/null
+    line=$(answer shape box 3 3 3)
+    echo "$line" | grep -q "Box (Solid) 3x3x3" || fail "the filtered quarry card's shape: $line"
+    line=$(answer offset 6 0 0)
+    echo "$line" | grep -q "Card offset set to 6 0 0" || fail "the filtered quarry card's offset: $line"
+    line=$(answer type quarry)
+    echo "$line" | grep -q "Card type set to quarry" || fail "the filtered quarry card's type: $line"
+    line=$(answer tagmatching off)
+    echo "$line" | grep -q "Card tag matching off" || fail "the filtered quarry card's tag toggle: $line"
+    line=$(answer filter "$value" "$mode")
+    echo "quarry filter command: $line"
+    echo "$line" | grep -q "Card filters $value blocks ($mode)" || fail "the quarry filter command: $line"
+    install_held_card "Box (Solid) 3x3x3 offset 6 0 0"
+}
+
+quarry_filter_rig 20 -20
+line=$(energy "$QX" "$QY" "$QZ")
+echo "quarry-filter energy before: $line"
+[ "$(energy_of "$line")" = 1000000 ] || fail "the quarry-filter rig did not hold 1000000 FE: $line"
+# The replacement is cobblestone so a quarried dirt cell is distinguishable from a skipped
+# stone cell (the jar's default dirt would be the same id as the allowed cells' block).
+line=$(answer replace "$QX" "$QY" "$QZ" minecraft:cobblestone)
+echo "quarry-filter replace: $line"
+echo "$line" | grep -q "Builder replacement set to minecraft:cobblestone" || fail "the replacement: $line"
+install_filtered_quarry_card minecraft:stone deny
+ctl wait 160 >/dev/null
+line=$(status "$QX" "$QY" "$QZ")
+echo "quarry-filter status: $line"
+# 27 cells total: 9 allowed dirt cells are quarried, 18 denied stone cells are skipped. The
+# SELFTEST inverts only this skip count, so the assertion cannot pass vacuously.
+qf_expected_skip=18
+[ "$SELFTEST" = filterquarry ] && qf_expected_skip=17
+echo "$line" | grep -q "27 cells, quarry (Normal quarry), replacing with minecraft:cobblestone, 9 quarried, ${qf_expected_skip} skipped, scan complete" \
+    || fail "the quarry filter skipped $(echo "$line" | sed -nE 's/.* ([0-9]+) skipped.*/\1/p') cells; expected $qf_expected_skip"
+line=$(energy "$QX" "$QY" "$QZ")
+echo "quarry-filter energy after: $line"
+[ "$(filter_spent_of "$line")" = $((qf_expected_skip * 50)) ] \
+    || fail "the skipped quarry cells spent $(filter_spent_of "$line") FE; expected $((qf_expected_skip * 50)) = $qf_expected_skip x 50"
+qf_dirt=$(chest_count "$QX" $((QY + 1)) "$QZ" minecraft:dirt)
+qf_cobble=$(chest_count "$QX" $((QY + 1)) "$QZ" minecraft:cobblestone)
+qf_total=$(chest_total "$QX" $((QY + 1)) "$QZ")
+echo "quarry-filter chest: $qf_dirt dirt, $qf_cobble cobblestone (total $qf_total)"
+# Only the 9 allowed cells' drops were collected; the denied stone yielded no cobblestone.
+[ "$qf_dirt" -eq 9 ] || fail "the quarry filter collected $qf_dirt dirt; expected 9"
+[ "$qf_cobble" -eq 0 ] || fail "a denied stone cell handed out $qf_cobble cobblestone"
+[ "$qf_total" -eq 9 ] || fail "the quarry-filter chest holds $qf_total items; expected 9"
+# The denied cells are still stone; the allowed ones became the replacement block.
+qf_stone=$(volume_cells | awk '$4 == "minecraft:stone"' | wc -l)
+qf_replaced=$(volume_cells | awk '$4 == "minecraft:cobblestone"' | wc -l)
+echo "quarry-filter volume: $qf_stone stone kept, $qf_replaced replacement"
+[ "$qf_stone" -eq 18 ] || fail "$qf_stone denied stone cells were broken; expected 18 left in place"
+[ "$qf_replaced" -eq 9 ] || fail "$qf_replaced allowed cells were quarried; expected 9"
+
+# CONTROL: the identical mixed rig with no filter — every cell is quarried and collected.
+quarry_filter_rig 24 -24
+line=$(answer replace "$QX" "$QY" "$QZ" minecraft:cobblestone)
+echo "quarry-filter-control replace: $line"
+install_quarry_card quarry off
+ctl wait 160 >/dev/null
+line=$(status "$QX" "$QY" "$QZ")
+echo "quarry-filter-control status: $line"
+echo "$line" | grep -q "27 cells, quarry (Normal quarry), replacing with minecraft:cobblestone, 27 quarried, scan complete" \
+    || fail "the filterless quarry did not finish all 27 cells: $line"
+line=$(energy "$QX" "$QY" "$QZ")
+echo "quarry-filter-control energy: $line"
+[ "$(filter_spent_of "$line")" = 0 ] || fail "a filterless quarry spent $(filter_spent_of "$line") FE on skips"
+qfc_dirt=$(chest_count "$QX" $((QY + 1)) "$QZ" minecraft:dirt)
+qfc_cobble=$(chest_count "$QX" $((QY + 1)) "$QZ" minecraft:cobblestone)
+qfc_total=$(chest_total "$QX" $((QY + 1)) "$QZ")
+echo "quarry-filter-control chest: $qfc_dirt dirt, $qfc_cobble cobblestone (total $qfc_total)"
+[ "$qfc_dirt" -eq 9 ] && [ "$qfc_cobble" -eq 18 ] && [ "$qfc_total" -eq 27 ] \
+    || fail "the filterless quarry did not collect everything ($qfc_dirt dirt, $qfc_cobble cobble, total $qfc_total)"
+
+QX=$o_QX; QZ=$o_QZ; VX1=$o_VX1; VX2=$o_VX2; VZ1=$o_VZ1; VZ2=$o_VZ2
+
 say "the Builder's loot table drops the Builder"
 # `ctl break` mines the way a player does: survival (creative's instant break is not on that path)
 # and far from the world spawn, whose protection refuses a non-op player's break. So the block is
@@ -1093,4 +1202,4 @@ cards=$(count_item "$CARD")
 echo "cards in the inventory after reset: $cards"
 [ "$cards" -eq 1 ] || fail "the reset consumed the card ($cards left)"
 
-echo "PASS: both carried recipes craft in a real crafting table (the shape card from 4 paper, 2 bricks, 1 iron ingot and 2 redstone; the Builder from 4 bricks, an ender pearl, 3 redstone and a machine frame) with their ingredients consumed and their wrong-ingredient controls empty, the game log has no rejected ingredient, the Builder fills its 3x3x3 box from the chest above it (24 placed, 64 -> 40), a hollow 5x5x5 is a 98-cell shell (92 placed against a full chest), a box outside the world border builds 0 and spends nothing, a quarry card over 27 cells breaks them and leaves the configured replacement (25 cobblestone collected, the gravel and the tag-matched coarse dirt voided and not collected), the quarry card keeps its type and void list when it is taken out and put back, tag matching off collects the coarse dirt again, /rftoolsbuilder replace changes the replacement, a void card over 27 stone leaves 27 dirt with 27 quarried and 27 voided and collects nothing while a normal quarry card on the same rig collects all 27, a box card on the same rig collects nothing, a charged quarry's 27 cells spend exactly 8100 FE while a void card's spend 6750 FE and an empty buffer stalls at 0 quarried with 'not enough power', the Builder's loot table drops it, the card goes in, comes back out, resets to the 5x5x5 default, the placed volume survives a relaunch, a deny filter skips its 18 stone cells and spends exactly 18 x 50 = 900 FE on them while an empty filter spends 0, and the filter readout is fail-capable"
+echo "PASS: both carried recipes craft in a real crafting table (the shape card from 4 paper, 2 bricks, 1 iron ingot and 2 redstone; the Builder from 4 bricks, an ender pearl, 3 redstone and a machine frame) with their ingredients consumed and their wrong-ingredient controls empty, the game log has no rejected ingredient, the Builder fills its 3x3x3 box from the chest above it (24 placed, 64 -> 40), a hollow 5x5x5 is a 98-cell shell (92 placed against a full chest), a box outside the world border builds 0 and spends nothing, a quarry card over 27 cells breaks them and leaves the configured replacement (25 cobblestone collected, the gravel and the tag-matched coarse dirt voided and not collected), the quarry card keeps its type and void list when it is taken out and put back, tag matching off collects the coarse dirt again, /rftoolsbuilder replace changes the replacement, a void card over 27 stone leaves 27 dirt with 27 quarried and 27 voided and collects nothing while a normal quarry card on the same rig collects all 27, a box card on the same rig collects nothing, a charged quarry's 27 cells spend exactly 8100 FE while a void card's spend 6750 FE and an empty buffer stalls at 0 quarried with 'not enough power', the Builder's loot table drops it, the card goes in, comes back out, resets to the 5x5x5 default, the placed volume survives a relaunch, a deny filter skips its 18 stone cells and spends exactly 18 x 50 = 900 FE on them while an empty filter spends 0, and a deny filter on a QUARRY card skips its 18 stone cells without breaking them or collecting their drops (9 quarried, 18 skipped, 900 FE, the chest holds only the 9 allowed dirt drops) while a filterless quarry on the same rig collects all 27, and both filter readouts are fail-capable"

@@ -29,16 +29,16 @@ Status: **ported-partial** — slice 1 (the Builder's shaped mode with its shape
 cards), slice 2 (the carried recipes repaired to the 26.3 dialect and proven in
 game), slice 3 (the quarry card type, its void list and the replacement block),
 slice 4 (`CARD_VOID`), slice 5 (quarry chunk loading), slice 6 (the FE buffer
-and the per-cell cost) and slice 7 (the filter module and filtered placement)
-are implemented, their 54 runtime tests and 12 glue tests
-(66 in all) are green, the SDK gate is green,
+and the per-cell cost), slice 7 (the filter module and filtered placement) and
+slice 8 (the quarry's filter path) are implemented, their 57 runtime tests and 12
+glue tests (69 in all) are green, the SDK gate is green,
 and the package is **verified in a launcher-built game**: the modded leg passes
 every phase including the quarry's, the void card's, the exact energy-consumption
-readout, the filter's 18 × 50 FE skip spend and the force-load leg, the unmodded
-control and the seven selftest legs fail. The gap list below is the rest of the mod.
+readout, both filters' 18 × 50 FE skip spends and the force-load leg, the unmodded
+control and the eight selftest legs fail. The gap list below is the rest of the mod.
 
-Package at **0.2.7**: **85,091 B**, SHA-256
-`6b61c2be83f6f0a35ff2a41883eae322f018fd6fc48e5793cd6c5947f02fefdc`, built twice byte-identically against SDK **`0a875da9…`** + mixins
+Package at **0.2.8**: **86,300 B**, SHA-256
+`3b27c182f1ed48ffc1e1bae46342be5bf9b1849f9e9d8318954682fd3e9b81d1`, built twice byte-identically against SDK **`0a875da9…`** + mixins
 `e59da90…` (`check` exit 0, `fits` `made for` at the pin and `fits` at `0b14f8a`).
 The command → exact-output → log table for every number below is
 [`VALIDATION.md`](VALIDATION.md); the canonical logs are `sdk-test.log`,
@@ -1275,6 +1275,130 @@ so the shipped readout itself answers `N placed, M skipped`.
 
 Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
 
+## Slice 8 (0.2.8, 2026-11-24) — the quarry's filter path
+
+The gap line this slice answers, verbatim from *Gaps* 9 after slice 7: *"The multi-entry module GUI and
+the quarry's `collectItem` filter are the remaining differences (slice-7 section)."* It is also
+deliberate difference 2 of slice 7: *"The quarry path keeps its own void list and does not consult
+the filter. Upstream applies the cache to both paths..."*. It fits `deep`'s machine-shaped half
+exactly as slices 3–7 did: one more pure call in the Builder's existing tick and one skip charge,
+with no new block, item, renderer, recipe or registration.
+
+### The quarry call sites, read from the artefact (not inferred)
+
+`javap -c -p` over `BuilderTileEntity.class` in
+`rftoolsbuilder-1.21-7.0.8.jar` (1,054,376 B, branch `1.21_neo` @ `409049466`), in the jar's own
+order:
+
+- `commonQuarryBlock(boolean, int, BlockPos, BlockState)`: after the Builder's ±1 box, `isEmpty`,
+  `getDestroySpeed < 0`, the replacement-block guard and `allowedToBreak`, it reads
+  `items.getStackInSlot(1)` (`SLOT_FILTER`, bytecode 280..295); when non-empty and
+  `filterCache.get()` is non-null it tests
+  `filter.get().test(block.getCloneItemStack(level, pos, state))` (298..334). On a false test it
+  calls `energyStorage.consumeEnergy(Math.min(energyStored, builderRfPerSkipped))` and returns
+  `skip(data)` (349..384): the block stays, **no drops are rolled**, and the **50 FE**
+  (`builderRfPerSkipped`, `bipush 50`) skip is the only charge. The filter check precedes
+  `cachedVoidableBlocks` (385) and the drop rollout.
+- `collectItem(Level, float, ItemEntity)`: the same `filterCache` predicate is applied to the
+  collected stack (bytecode 6..38); a rejected stack is left in the world (`ireturn false`), so a
+  denied drop is never inserted.
+- `createFilterCache()` reads slot 1 and returns `FilterModuleItem.getCache(stack)`; an empty slot
+  gives no predicate, so no cell is filtered.
+
+The port has no item entities in this path (`support::insert_drops` feeds the container directly),
+so the artefact's two call sites reduce to **one** call in `quarry_cell`: test the proved
+`filter_match` on the block id before any drop is rolled, charge `spend_skip` (min(held, 50), never
+suspends), and skip. The drop rule is unchanged for allowed cells; a denied block is neither
+broken nor replaced, matching `skip(data)`.
+
+### Red → green
+
+- **Red (unit):** the three new tests — `a_quarry_cell_the_filter_denies_is_skipped_before_any_drop`,
+  `the_quarry_filter_runs_before_the_void_path_and_the_drops` and
+  `the_proved_filter_rule_decides_the_quarry_path_by_id_and_tag` — were written before the rule and
+  failed to compile (`evidence/rftoolsbuilder/red-filterquarry-compile.log`):
+
+  ```
+  error[E0560]: struct `runtime::CellFacts` has no field named `filter_passes`
+  error[E0599]: no variant or associated item named `Filtered` found for enum `runtime::SkipReason`
+  error: could not compile `rftoolsbuilder` (lib test) due to 8 previous errors
+  TEST_EXIT:101
+  ```
+
+  A second red (the first green attempt, `test-green-quarryfilter.log`) caught a defect in the
+  **test**: a deny-by-id filter must not reject a tag member; the tag case was rewritten with a
+  `#minecraft:stones` filter, not by weakening the rule.
+- **Red (in game, before the glue):** the new leg on the published **0.2.7** game
+  (`e2e-filterquarry-027-red.log`) finished the rig as `27 quarried, scan complete` with **no**
+  skips and failed `FAIL: the quarry filter skipped  cells; expected 18` + `EXIT:1`.
+- **Green:** `cargo test --offline` → `running 69 tests` · `test result: ok. 69 passed; 0 failed`
+  (`sdk-test.log`, regenerated for 0.2.8 after the final build: 57 runtime + 12 glue).
+
+### In game (0.2.8)
+
+Quoted from `../_shared/evidence/rftoolsbuilder-e2e/e2e-package.log` — a fresh charged Builder
+over a 27-cell box of 18 stone (denied) and 9 dirt (allowed), with the replacement set to
+cobblestone so a quarried cell is distinguishable from a skipped one:
+
+```
+quarry filter command: Card filters minecraft:stone blocks (deny)
+quarry-filter status: Builder at 42 102 -18: Box (Solid) 3x3x3 offset 6 0 0, 27 cells, quarry (Normal quarry), replacing with minecraft:cobblestone, 9 quarried, 18 skipped, scan complete
+quarry-filter energy after: Builder at 42 102 -18: energy 996400/1000000 FE, spent 3600 FE, build 500 FE/cell, quarry 300 FE/cell, void 250 FE/cell, skip 50 FE/cell, infusion 0, filter skipped 900 FE
+quarry-filter chest: 9 dirt, 0 cobblestone (total 9)
+quarry-filter volume: 18 stone kept, 9 replacement
+quarry-filter-control status: Builder at 46 102 -22: ... 27 quarried, scan complete
+quarry-filter-control energy: ... spent 8100 FE, ..., filter skipped 0 FE
+quarry-filter-control chest: 9 dirt, 18 cobblestone (total 27)
+```
+
+The status line reports the **acted** cells (`9 quarried`) and the **denied** ones (`18 skipped`)
+out of the 27 the pass visited; the skip spend is exactly `18 × 50 = 900 FE`, separate from the
+`9 × 300 = 2700 FE` the allowed cells cost (`spent 3600`). The denied cells are still stone and
+the chest holds only the 9 dirt drops — no cobblestone was handed out for a skipped block. The
+filterless differential on the same mixed rig quarries all 27 and collects 9 dirt + 18
+cobblestone, spending 0 skip FE. `SELFTEST=filterquarry` expects 17 skips and exits 1;
+the same leg on the **0.2.7** game (`e2e-filterquarry-027-red.log`) read `27 quarried` with no
+skips and exited 1 — the glue was absent before this slice.
+
+### Coverage — the quarry-filter family (ruling 2026-11-20)
+
+| family | status | proof |
+|---|---|---|
+| `commonQuarryBlock`'s `filterCache` test on the clone stack | **tested** | unit: `a_quarry_cell_the_filter_denies_is_skipped_before_any_drop`; in game: `/rftoolsbuilder filter minecraft:stone deny` on a quarry card skips exactly the 18 stone cells |
+| the filter before the void list and the drops | **tested** | unit: `the_quarry_filter_runs_before_the_void_path_and_the_drops`; in game: the denied cells stay `minecraft:stone` and the chest holds only the 9 allowed cells' dirt, never cobblestone |
+| `builderRfPerSkipped` (50 FE) on a quarry skip | **tested** | in game: `filter skipped 900 FE` = 18 × 50, with the allowed cells' quarry spend separate; `SELFTEST=filterquarry` (expects 17) `EXIT:1` |
+| id and `#tag` filter values, allow/deny | **tested** | unit: `the_proved_filter_rule_decides_the_quarry_path_by_id_and_tag` uses the shaped path's proved `filter_match` for both spellings and both modes |
+| the filterless differential | **tested** | in game: the same mixed rig with no filter quarries all 27 and collects 9 dirt + 18 cobblestone, spending 0 skip FE |
+| the multi-entry filter-module GUI/item | **not ported** | the package carries one card with a one-entry command; no GUI or item list in the format (slice-7 deviation 1) |
+| `collectItem`'s separate item-entity gate | **not ported (equivalent)** | the port inserts drops directly into the container, so the block-side skip is the single place a denied drop could be created; no item entity survives to be collected |
+
+### Ladder (0.2.8)
+
+Every step ran through `ports/tools/build-slot.sh` with the **relative**
+`--port ports/rftoolsbuilder`, job `W1-rftoolsbuilder`, `CARGO_INCREMENTAL=0`, no
+`--target-dir`, no private slot registry. The Rust steps forwarded to `AdLf-PC`
+(`build-slot: forwarding <step> … to the remote runner`; no `BUILD_LOCAL=1`). The
+launcher game build ran locally (`BUILD_LOCAL=1`: no launcher/26.3 resources on the remote).
+
+| Step | Command | Result | Log |
+|---|---|---|---|
+| red (unit) | `cargo test --offline`, three quarry-filter tests first | `cannot find field filter_passes`, `no variant Filtered`, `due to 8 previous errors`, `TEST_EXIT:101` | `../_shared/evidence/rftoolsbuilder/red-filterquarry-compile.log` |
+| red (in game, 0.2.7 game) | `tools/e2e.sh` with the new phase | `27 quarried, scan complete`, no skips, `FAIL: the quarry filter skipped  cells; expected 18` + `EXIT:1` | `../rftoolsbuilder-e2e/e2e-filterquarry-027-red.log` |
+| unit tests | `cargo test --offline` | `running 69 tests` · `69 passed; 0 failed`; doc-tests 0 | `sdk-test.log` |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | `CLIPPY_EXIT:0`, 0 warnings | `clippy.log` |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | `FMT_EXIT:0` | `fmt.log` |
+| SDK gate | `cargo horizon-mod check` | 518 API items, `Made for 0a875da.`, `CHECK_EXIT:0` | `check.log` |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | `CMP_IDENTICAL`, 86,300 B | `build.log`, `build2.log` |
+| registry check | `cargo horizon-mod check rftoolsbuilder.hmod` | `rftoolsbuilder 0.2.8 (native-mod, … for 26.3)`, 86,300 B, sha `3b27c182…b81d1`, `FILE_CHECK_EXIT:0` | `file-check-fits.log` |
+| fits, the pin | `… --build 0a875da…` | `0a875da  made for`, `FITS_PIN_EXIT:0` | `file-check-fits.log` |
+| fits, a different build | `… --build 0b14f8a…` | `0b14f8a  fits`, `FITS_OTHER_EXIT:0` | `file-check-fits.log` |
+| package gate | `verify-sdk-package.py rftoolsbuilder` | **1/1** (`package matches the tree`, `runtime byte-identical 8e649ec75c6a`, R9 clean, 31 entries, no packed `Cargo.lock`) | — |
+| game build | `bundle-game.sh` (stale `native-0a875da-*` tags removed first) | `Compiling rftoolsbase (1 of 2)` / `Compiling rftoolsbuilder (2 of 2)`, `native-0a875da-9b9d38c35710` | `../rftoolsbuilder-e2e/bundle-game-build-028.log` |
+| in-game | the default leg + eight negative legs + the three chunk-load legs | `PASS` + `EXIT:0`; control and eight selftests `EXIT:1` | `../rftoolsbuilder-e2e/*.log` |
+| log gate | `check-e2e-logs.py rftoolsbuilder-e2e --strict` | `logs=18 ok=18 missing-exit=0 bad-exit=0` | — |
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
+
 ## Gaps
 
 1. ~~**No in-game run.**~~ **Closed 2026-11-21**: `ports/tools/launcher-game.sh` and
@@ -1303,9 +1427,10 @@ Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-de
 9. ~~**The filter module** and filtered placement (`FilterModuleItem`).~~
    **Carried 2026-11-24** (slice 7, 0.2.7): allow/deny and id/`#tag` filtering in
    the shaped tick, the `builderRfPerSkipped` 50 FE skip charge, the second
-   container slot and `/rftoolsbuilder filter`. The multi-entry module GUI and
-   the quarry's `collectItem` filter are the remaining differences (slice-7
-   section).
+   container slot and `/rftoolsbuilder filter`. ~~The quarry's `collectItem` filter~~
+   **carried 2026-11-24** (slice 8, 0.2.8): the same `filter_match` now runs in
+   `quarry_cell` before any drop is rolled, charging the 50 FE skip (see *Slice 8*).
+   Only the multi-entry module GUI/item remains (a format limit, not a gap in the tick).
 10. ~~**Energy**: no FE buffer, no per-block cost, no infusion factor
     (`GenericEnergyStorage`, `BuilderConfiguration.builderRfPer*`).~~ **Carried
     2026-11-24** (slice 6, 0.2.6): the Builder declares a `ModEnergyBuffer` with
@@ -1332,8 +1457,8 @@ Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-de
 
 ## Verification
 
-Slice 1's run (0.2.0) is the table below; the current **0.2.7** numbers are in
-*Ladder (0.2.7)* in the slice-7 section above, and the file-level record is
+Slice 1's run (0.2.0) is the table below; the current **0.2.8** numbers are in
+*Ladder (0.2.8)* in the slice-8 section above, and the file-level record is
 [`VALIDATION.md`](VALIDATION.md).
 
 Every command ran through `ports/tools/build-slot.sh` (one lease per step); logs

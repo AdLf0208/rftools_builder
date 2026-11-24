@@ -1,4 +1,4 @@
-# Validation record — `rftoolsbuilder` 0.2.7
+# Validation record — `rftoolsbuilder` 0.2.8
 
 What was run, on which file, and the exact line it printed. Every log named
 here lives in `ports/_shared/evidence/rftoolsbuilder/` unless it says otherwise.
@@ -6,78 +6,76 @@ Rust steps went through `ports/tools/build-slot.sh` (one lease per step,
 `CARGO_INCREMENTAL=0`, relative `--port ports/rftoolsbuilder`, job
 `W1-rftoolsbuilder`, no `--target-dir`) and **forwarded to `AdLf-PC`** — the
 runner printed `build-slot: forwarding <step> for ports/rftoolsbuilder to the
-remote runner`. The `horizon-launcher` game build and all in-game legs ran
-locally (`BUILD_LOCAL=1` on the build that genuinely cannot run remotely: no
-launcher, prepared 26.3 resources or `jq` there); `--step e2e` is not forwarded
-by the runner at all.
+remote runner`. The `horizon-launcher` game build ran locally (`BUILD_LOCAL=1`
+on that step only: no launcher or prepared 26.3 resources on the remote);
+`--step e2e` is not forwarded by the runner at all.
 
 ## The file every number applies to
 
 ```
 ports/rftoolsbuilder/rftoolsbuilder.hmod
-  version 0.2.7     85091 bytes
-  sha256  6b61c2be83f6f0a35ff2a41883eae322f018fd6fc48e5793cd6c5947f02fefdc
+  version 0.2.8     86300 bytes
+  sha256  3b27c182f1ed48ffc1e1bae46342be5bf9b1849f9e9d8318954682fd3e9b81d1
   [native] game 26.3 · horizon 0a875da91dbb0fdcb7ba8c42c11341aa229af51a · mixins e59da9094f0c2fdda6c627fe9eff22dec6a906f0
   31 entries, no packed Cargo.lock
 ```
 
 `verify-sdk-package.py rftoolsbuilder` → **1/1** (`package matches the tree`,
-`runtime byte-identical 2f54aad2c19d`, R9 clean, `31 entries`, no packed
+`runtime byte-identical 8e649ec75c6a`, R9 clean, `31 entries`, no packed
 `Cargo.lock`, skills gate PASS).
 
 ## Ladder
 
 | # | command | exact result | log |
 |---|---|---|---|
-| 1 | `cargo test --offline` | `running 66 tests` · `test result: ok. 66 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.86s` · `Doc-tests rftoolsbuilder` · `running 0 tests` · `test result: ok. 0 passed; …`; `TEST_EXIT:0` | `sdk-test.log` |
+| 1 | `cargo test --offline` | `running 69 tests` · `test result: ok. 69 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.05s` · `Doc-tests rftoolsbuilder` · `running 0 tests` · `test result: ok. 0 passed; …`; `TEST_EXIT:0` | `sdk-test.log` |
 | 2 | `cargo clippy --all-targets --offline -- -D warnings` | `CLIPPY_EXIT:0`, 0 warnings | `clippy.log` |
 | 3 | `rustfmt --edition 2024 --check src/lib.rs src/support.rs src/runtime.rs` | `FMT_EXIT:0`, empty output | `fmt.log` |
-| 4 | `cargo horizon-mod check` | `RFTools Builder uses 518 items of the API (5 Part kinds, 1 associated item, 3 capabilitys, 118 fields or variants, 13 hooks, 26 hook arguments, 2 macros, 198 methods, 36 traits, 116 types). Made for 0a875da.` + the compatibility notes; `CHECK_EXIT:0` | `check.log` |
+| 4 | `cargo horizon-mod check` | `RFTools Builder uses 518 items of the API (5 Part kinds, 1 associated item, 3 capabilitys, 118 fields or variants, 13 hooks, 26 hook arguments, 2 macros, 198 methods, 36 traits, 116 types). Made for 0a875da.` + compatibility notes; `CHECK_EXIT:0` | `check.log` |
 | 5 | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | `Built ./target/horizon-mod/rftoolsbuilder.hmod` twice, `CMP_IDENTICAL` | `build.log`, `build2.log` |
-| 6 | `cargo horizon-mod check rftoolsbuilder.hmod` | `rftoolsbuilder 0.2.7 (native-mod, format native-1/0a875da91dbb0fdcb7ba8c42c11341aa229af51a/e59da9094f0c2fdda6c627fe9eff22dec6a906f0, for 26.3)` / `85091 bytes, SHA-256 6b61c2be…f02fefdc` / `FILE_CHECK_EXIT:0` | `file-check-fits.log` |
-| 7 | `cargo horizon-mod fits rftoolsbuilder.hmod --build 0a875da91dbb0fdcb7ba8c42c11341aa229af51a` | `RFTools Builder:` / `0a875da  made for` / `FITS_PIN_EXIT:0` | `sdk-fits.log` |
-| 8 | `cargo horizon-mod fits rftoolsbuilder.hmod --build 0b14f8acfd97fa2c750e42795249dcc981178ca4` | `RFTools Builder:` / `0b14f8a  fits` / `FITS_OTHER_EXIT:0` | `sdk-fits-other.log` |
+| 6 | `cargo horizon-mod check rftoolsbuilder.hmod` | `rftoolsbuilder 0.2.8 (native-mod, format native-1/0a875da91dbb0fdcb7ba8c42c11341aa229af51a/e59da9094f0c2fdda6c627fe9eff22dec6a906f0, for 26.3)` / `86300 bytes, SHA-256 3b27c182…b81d1` / `FILE_CHECK_EXIT:0` | `file-check-fits.log` |
+| 7 | `cargo horizon-mod fits rftoolsbuilder.hmod --build 0a875da91dbb0fdcb7ba8c42c11341aa229af51a` | `RFTools Builder:` / `0a875da  made for` / `FITS_PIN_EXIT:0` | `file-check-fits.log` |
+| 8 | `cargo horizon-mod fits rftoolsbuilder.hmod --build 0b14f8acfd97fa2c750e42795249dcc981178ca4` | `RFTools Builder:` / `0b14f8a  fits` / `FITS_OTHER_EXIT:0` | `file-check-fits.log` |
 | 9 | `python3 ports/tools/verify-sdk-package.py rftoolsbuilder` | `1/1 package(s) verified` | — |
-| 10 | the eleven in-game legs (below) | `PASS` + `EXIT:0`; control and seven selftests `EXIT:1` | `../rftoolsbuilder-e2e/*.log` |
-| 11 | `python3 ports/tools/check-e2e-logs.py rftoolsbuilder-e2e --strict` | `logs=16 ok=16 missing-exit=0 bad-exit=0`, exit 0 | — |
+| 10 | the in-game legs (below) | `PASS` + `EXIT:0`; control and eight selftests `EXIT:1` | `../rftoolsbuilder-e2e/*.log` |
+| 11 | `python3 ports/tools/check-e2e-logs.py rftoolsbuilder-e2e --strict` | `logs=18 ok=18 missing-exit=0 bad-exit=0`, exit 0 | — |
 | 12 | `python3 tools/check_recipes.py .` | `recipes PASS: 2 carried recipe files use 26.3 bare item/tag ingredients` | `recipe-guard-green.log` |
 
 The two `test result:` lines above are the whole `cargo test` output for this
-crate: one lib test binary (66) and doc-tests (0). The 54/12 split in `notes.md`
-is the `runtime::tests` / `support::tests` count inside that 66 (`grep -c` over
-`sdk-test.log`).
+crate: one lib test binary (69) and doc-tests (0). The 57/12 split in `notes.md`
+is the `runtime::tests` / `support::tests` count inside that 69.
 
-## Red proofs (0.2.7)
+## Red proofs (0.2.8)
 
-The five filter tests were written first, so the first run could not compile:
+The three quarry-filter tests were written first, so the first run could not compile:
 
 ```
-error[E0422]: cannot find struct, variant or union type `Filter` in this scope
-error[E0433]: cannot find type `FilterMode` in this scope
-error[E0425]: cannot find function `filter_match` in this scope
-error[E0425]: cannot find function `filter_skip_cost` in this scope
-error: could not compile `rftoolsbuilder` (lib test) due to 24 previous errors
+error[E0560]: struct `runtime::CellFacts` has no field named `filter_passes`
+error[E0599]: no variant or associated item named `Filtered` found for enum `runtime::SkipReason`
+error: could not compile `rftoolsbuilder` (lib test) due to 8 previous errors
 TEST_EXIT:101
 ```
 
-(`red-filter-compile.log`.) The earlier red proofs remain in
-`red-energy-compile.log`, `red-chunkload-compile.log`, `red-void-compile.log`,
-`red-quarry-compile.log`, `red-quarry-rule.log` and `red-quarry-void.log`.
+(`red-filterquarry-compile.log`.) A second red caught a defect in the **test**
+(`test-green-quarryfilter.log` first attempt): a deny-by-id filter must not reject
+a tag member, so the tag case was rewritten with a `#minecraft:stones` filter.
 
-A second red caught a harness/API defect while adding the in-game leg: the
-filter value was first registered as `<value:word>`, whose brigadier parser
-rejects `:` (`is_allowed_in_unquoted` has no colon), so the command never
-answered; and `minecraft:grass` is not a registered block at this pin. The
-value now uses `<value:resource:minecraft:block>` + a `filter none` usage, and
-the mixed volume uses `minecraft:stone` / `minecraft:air`.
+The in-game counterfactual runs the new leg on the **0.2.7** game before the
+glue existed: `27 quarried, scan complete` with no skips, then
+`FAIL: the quarry filter skipped  cells; expected 18` + `EXIT:1`
+(`../rftoolsbuilder-e2e/e2e-filterquarry-027-red.log`). The earlier red proofs
+remain in `red-filter-compile.log`, `red-energy-compile.log`,
+`red-chunkload-compile.log`, `red-void-compile.log`, `red-quarry-compile.log`,
+`red-quarry-rule.log` and `red-quarry-void.log`.
 
 ## In-game legs
 
 The game carries **both** `rftoolsbuilder` and `rftoolsbase` (the Builder's
 recipe needs `rftoolsbase:machine_frame`, upstream's required parent):
 `ports/_shared/evidence/rftoolsbuilder-e2e/bundle-game.sh` builds and exports it
+after the stale `native-0a875da-*` tags are removed
 (`Compiling rftoolsbase (1 of 2)` / `Compiling rftoolsbuilder (2 of 2)`,
-`native-0a875da-f33935421aa0`).
+`native-0a875da-9b9d38c35710`).
 
 | leg | command | result | log |
 |---|---|---|---|
@@ -88,11 +86,12 @@ recipe needs `rftoolsbase:machine_frame`, upstream's required parent):
 | `SELFTEST=void` | the same game | `FAIL: the void card moved 0 items; expected 1` + `EXIT:1` | `e2e-void-selftest.log` |
 | `SELFTEST=energy` | the same game | `FAIL: the quarry spent 8100 FE; expected 8101` + `EXIT:1` | `e2e-energy-selftest.log` |
 | `SELFTEST=filter` | the same game | `FAIL: the filter skipped 18 cells; expected 17` + `EXIT:1` | `e2e-filter-selftest.log` |
+| `SELFTEST=filterquarry` | the same game | `FAIL: the quarry filter skipped 18 cells; expected 17` + `EXIT:1` | `e2e-filterquarry-selftest.log` |
+| quarry-filter, before the glue (0.2.7) | the same leg on the old game | `FAIL: the quarry filter skipped  cells; expected 18` + `EXIT:1` | `e2e-filterquarry-027-red.log` |
 | chunk load | `GAME=<bundle game> tools/e2e-chunkload.sh` | **`PASS`** + `EXIT:0` | `e2e-chunkload.log` |
-| 0.2.4 counterfactual | the same script on the old game | `0 quarried … refused at …: the chunk is not loaded` + `EXIT:1` | `e2e-chunkload-024-red.log` |
 | chunk-load control | `GAME=$CONTROL_GAME tools/e2e-chunkload.sh` | `FAIL: the first Builder is not at …` + `EXIT:1` | `e2e-chunkload-control.log` |
-| `SELFTEST=chunkload` | the same game | `FAIL: chunkload selftest: the pass completed in the unloaded chunk` + `EXIT:1` | `e2e-chunkload-selftest.log` |
-| log gate | `check-e2e-logs.py rftoolsbuilder-e2e --strict` | `logs=16 ok=16 missing-exit=0 bad-exit=0` | — |
+| `SELFTEST=chunkload` | the same script | `FAIL: chunkload selftest: the pass completed in the unloaded chunk` + `EXIT:1` | `e2e-chunkload-selftest.log` |
+| log gate | `check-e2e-logs.py rftoolsbuilder-e2e --strict` | `logs=18 ok=18 missing-exit=0 bad-exit=0` | — |
 
 The energy phase's own numbers, from `e2e-package.log`: a fresh Builder charged
 `0 -> 1000000 FE (inserted 1000000)`, `energy 1000000/1000000 FE, spent 0 FE`
@@ -102,15 +101,25 @@ before the pass; after a 27-cell quarry, `energy 991900/1000000 FE, spent 8100 F
 at `0 quarried, refused at …: not enough power`. The filter phase reads:
 
 ```
-filter command: Card filters minecraft:stone blocks (deny)
-filter status: Builder at 33 102 -11: Box (Solid) 3x3x3 offset 6 0 0, 27 cells, 9 placed, 18 skipped, scan complete
-filter energy after: Builder at 33 102 -11: energy 994600/1000000 FE, spent 5400 FE, build 500 FE/cell, quarry 300 FE/cell, void 250 FE/cell, skip 50 FE/cell, infusion 0, filter skipped 900 FE
-filter command: Card filter cleared
-filter-control status: Builder at 37 102 -15: Box (Solid) 3x3x3 offset 6 0 0, 27 cells, 9 placed, 18 skipped, scan complete
-filter-control energy: Builder at 37 102 -15: energy 995500/1000000 FE, spent 4500 FE, …, filter skipped 0 FE
+filter status: Builder at 34 102 -10: Box (Solid) 3x3x3 offset 6 0 0, 27 cells, 9 placed, 18 skipped, scan complete
+filter energy after: ... spent 5400 FE, ..., filter skipped 900 FE
+filter-control energy: ... spent 4500 FE, ..., filter skipped 0 FE
 ```
 
-The 900 skip FE is exactly 18 × `builderRfPerSkipped` 50; the control spends 0.
+The new quarry-filter phase (a fresh charged Builder, 18 stone + 9 dirt, the
+replacement set to cobblestone) reads:
+
+```
+quarry-filter status: ... 27 cells, quarry (Normal quarry), replacing with minecraft:cobblestone, 9 quarried, 18 skipped, scan complete
+quarry-filter energy after: ... energy 996400/1000000 FE, spent 3600 FE, ..., filter skipped 900 FE
+quarry-filter chest: 9 dirt, 0 cobblestone (total 9)
+quarry-filter volume: 18 stone kept, 9 replacement
+quarry-filter-control status: ... 27 quarried, scan complete
+quarry-filter-control chest: 9 dirt, 18 cobblestone (total 27)
+```
+
+`9 × 300 = 2700` FE for the allowed cells plus `18 × 50 = 900` FE for the denied
+ones is the exact `spent 3600`; the control spends 0 skip FE and collects all 27.
 
 ## Do not read these as the current package
 
@@ -134,6 +143,7 @@ cargo horizon-mod check rftoolsbuilder.hmod
 cargo horizon-mod fits rftoolsbuilder.hmod --build 0a875da91dbb0fdcb7ba8c42c11341aa229af51a
 cargo horizon-mod fits rftoolsbuilder.hmod --build 0b14f8acfd97fa2c750e42795249dcc981178ca4
 python3 ../../ports/tools/verify-sdk-package.py rftoolsbuilder
+rm -rf "$HOME/.cache/horizon-e2e/root/data/horizon-launcher/versions"/native-0a875da-*
 eval "$(../../ports/_shared/evidence/rftoolsbuilder-e2e/bundle-game.sh env)"
 GAME=$GAME CTL=$CTL bash tools/e2e.sh                       # PASS + EXIT:0
 GAME=$CONTROL_GAME CTL=$CTL bash tools/e2e.sh               # EXIT:1 (control)
@@ -142,6 +152,7 @@ SELFTEST=quarry GAME=$GAME CTL=$CTL bash tools/e2e.sh       # EXIT:1
 SELFTEST=void GAME=$GAME CTL=$CTL bash tools/e2e.sh         # EXIT:1
 SELFTEST=energy GAME=$GAME CTL=$CTL bash tools/e2e.sh       # EXIT:1
 SELFTEST=filter GAME=$GAME CTL=$CTL bash tools/e2e.sh       # EXIT:1
+SELFTEST=filterquarry GAME=$GAME CTL=$CTL bash tools/e2e.sh # EXIT:1
 GAME=$GAME CTL=$CTL bash tools/e2e-chunkload.sh              # PASS + EXIT:0
 SELFTEST=chunkload GAME=$GAME CTL=$CTL bash tools/e2e-chunkload.sh  # EXIT:1
 python3 ../../ports/tools/check-e2e-logs.py rftoolsbuilder-e2e --strict

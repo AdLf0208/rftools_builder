@@ -1006,9 +1006,11 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
                 cursor,
                 quarry,
                 &card,
+                &filter,
                 &replace,
                 &mut event.entity.nbt,
                 &mut state.energy_spent,
+                &mut state.filter_skipped,
             ) {
                 QuarryCell::Skip => state.progress.skipped += 1,
                 QuarryCell::Void => {
@@ -1189,9 +1191,11 @@ fn quarry_cell(
     cursor: [i32; 3],
     quarry: Quarry,
     card: &Card,
+    filter: &Filter,
     replace: &str,
     nbt: &mut Compound,
     spent: &mut u64,
+    filter_skipped: &mut u64,
 ) -> QuarryCell {
     let Some(block_state) = level.block_state(host, cursor) else {
         return QuarryCell::Unreadable;
@@ -1210,6 +1214,11 @@ fn quarry_cell(
             .unwrap_or(-1.0),
         is_replacement: id == replace,
         voided: is_voided(&*host, card, block, &id),
+        // The same `filter_match` the shaped path proved, applied to the quarry's clone stack
+        // (here the block id and, for a `#tag` value, the host's block tag table).
+        filter_passes: filter_match(filter, &id, |_id, tag| {
+            host.block_in_tag(block, tag).unwrap_or(false)
+        }),
     };
     let step = runtime::quarry_step(quarry, facts);
     if step == QuarryStep::Skip(runtime::SkipReason::Empty) {
@@ -1217,6 +1226,13 @@ fn quarry_cell(
     }
     // The tag upstream leaves in place; checked before any drop is rolled (the defect above).
     if host.block_in_tag(block, DONT_REMOVE_ME).unwrap_or(false) {
+        return QuarryCell::Skip;
+    }
+    // `commonQuarryBlock` consumes `min(energyStored, builderRfPerSkipped)` on a filtered-out
+    // cell and calls `skip(data)`: the block stays, no drops are inserted, and the cell is never
+    // charged the quarry cost. `spend_skip` drains at most 50 FE without suspending, as upstream.
+    if step == QuarryStep::Skip(runtime::SkipReason::Filtered) {
+        spend_skip(nbt, spent, filter_skipped);
         return QuarryCell::Skip;
     }
     // `CARD_VOID` costs builderRfPerOperation × voidShapeCardFactor; the other quarry types
