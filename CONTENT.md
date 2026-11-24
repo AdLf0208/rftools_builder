@@ -23,10 +23,11 @@ machine casing.
 |---|---|---|
 | `rftoolsbuilder:shape_card_def` | `minecraft:paper` | `max_stack_size: 1`, as upstream's `stacksTo(1)`; its shape lives in the `rftoolsbuilder:shape_card` component. |
 
-The quarry (0.2.3) adds **no content**: the jar has nine shape-card items and this port
-carries one, so the card *type* (`ShapeCardType`) rides the same component as the shape
-(`type`, `voiding`, `tagMatching`), and the replacement block is the Builder's own saved
-data. No texture, model, lang line or recipe is added for it.
+The quarry (0.2.3) and the void card (0.2.4) add **no content**: the jar has nine
+shape-card items and this port carries one, so the card *type* (`ShapeCardType`) rides
+the same component as the shape (`type`, `voiding`, `tagMatching`), and the replacement
+block is the Builder's own saved data. No texture, model, lang line or recipe is added
+for either card type.
 
 ## Textures
 

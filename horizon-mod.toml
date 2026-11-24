@@ -1,9 +1,10 @@
 id = "rftoolsbuilder"
 name = "RFTools Builder"
-version = "0.2.3"
+version = "0.2.4"
 description = """RFTools Builder for Horizon: the Builder block and its shape cards. A card carries a
 shape (box, sphere, cylinder, capped cylinder, prism, cone, top and bottom dome, torus, heart) or
-one of the quarry card types (normal, silk touch, fortune, and their clearing variants), its size,
+one of the quarry card types (normal, silk touch, fortune, and their clearing variants) or the void
+card, its size,
 its offset and whether the shape is solid or hollow; the Builder walks that shape from the top and
 either places a block into each replaceable cell or, for a quarry, breaks the block there, collects
 its drops into a container above or below it and leaves the replacement block behind (or air, when

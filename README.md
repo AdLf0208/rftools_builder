@@ -31,6 +31,13 @@ A Horizon native mod (mod API 0.2) that ports **RFTools Builder 1.21-7.0.8**
   container above the Builder, else below; the Builder's replacement block (the
   jar's `minecraft:dirt`, `/rftoolsbuilder replace <x> <y> <z> <block>`) is left
   behind, or air for a clearing card.
+- **The void card type**: `/rftoolsbuilder type void` selects the jar's
+  `ShapeCardType.CARD_VOID` (`resourceSuffix void`, the `voidBlock` handler, HUD
+  `"    Void mode"`, `voidShapeCardFactor = 0.5`). It voids **every** breakable cell
+  of the card's box — nothing is collected and the Builder's replacement block is
+  left behind. The port reuses the same tested `QuarryStep::Void` path as the void
+  list, so a void card over 27 stone leaves 27 dirt and the container above the
+  Builder unchanged; a quarry card on the same rig still collects.
 - **The void list**: `/rftoolsbuilder void <stone|cobble|dirt|sand|gravel|netherrack|endstone>`
   removes those blocks without collecting them, and `/rftoolsbuilder tagmatching
   on|off` extends each material to its block tag (`getVoidedBlocks`). The card's
@@ -44,9 +51,9 @@ A Horizon native mod (mod API 0.2) that ports **RFTools Builder 1.21-7.0.8**
 ## What it does not do
 
 The movers and their controls, the shields, the space chamber, the composer, the
-projector, the scanner, the GUI screens, the liquid/pump cards, the void card, the
-filter module, energy and chunk loading are **not** carried. The `GAPS` list in
-`notes.md` names each with the upstream file that implements it.
+projector, the scanner, the GUI screens, the liquid/pump cards, the filter module,
+energy and chunk loading are **not** carried. The `GAPS` list in `notes.md` names
+each with the upstream file that implements it.
 
 ## Building
 

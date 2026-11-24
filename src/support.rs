@@ -1628,7 +1628,7 @@ pub(crate) fn on_run_mod_command(
 /// this port carries one card item, so the type rides the card).
 fn write_type(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> String {
     let Some(CommandArgumentValue::String(name)) = event.command.argument("type") else {
-        return "usage: /rftoolsbuilder type <shape|quarry|quarry_silk|quarry_fortune|quarry_clear|quarry_clear_silk|quarry_clear_fortune>".to_owned();
+        return "usage: /rftoolsbuilder type <shape|quarry|quarry_silk|quarry_fortune|quarry_clear|quarry_clear_silk|quarry_clear_fortune|void>".to_owned();
     };
     let Some(kind) = CardKind::parse(name) else {
         return format!(
@@ -1880,6 +1880,7 @@ mod tests {
                 silk: true,
                 fortune: false,
                 clearing: true,
+                voids: false,
             }),
             voiding: Voiding::empty().with("gravel").with("dirt"),
             tag_matching: true,
@@ -1979,6 +1980,7 @@ mod tests {
                     silk: false,
                     fortune: true,
                     clearing: false,
+                    voids: false,
                 }),
                 voiding: Voiding::empty().with("stone"),
                 tag_matching: false,
@@ -2090,6 +2092,7 @@ mod tests {
                     silk: false,
                     fortune: false,
                     clearing: false,
+                    voids: false,
                 }),
                 ..card
             },
@@ -2121,6 +2124,7 @@ mod tests {
                     silk: false,
                     fortune: false,
                     clearing: false,
+                    voids: false,
                 }),
                 voiding: Voiding::empty().with("gravel").with("dirt"),
                 tag_matching: true,
@@ -2131,6 +2135,7 @@ mod tests {
                     silk: true,
                     fortune: false,
                     clearing: true,
+                    voids: false,
                 }),
                 ..Card::default()
             },
@@ -2139,6 +2144,7 @@ mod tests {
                     silk: false,
                     fortune: true,
                     clearing: true,
+                    voids: false,
                 }),
                 voiding: Voiding::empty().with("endstone"),
                 ..Card::default()

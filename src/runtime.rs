@@ -65,6 +65,11 @@ pub const QUARRY_TOOL: &str = "minecraft:netherite_pickaxe";
 /// `getHarvesterTool(…, …, fortune)`: the level a fortune quarry's tool carries
 /// (`int fortune = getCardType().isFortune() ? 3 : 0`).
 pub const FORTUNE_LEVEL: u32 = 3;
+/// `BuilderConfiguration.voidShapeCardFactor` (0.5, range 0..1,000,000): the builder's RF per
+/// operation is multiplied by this for `ShapeCardType.CARD_VOID`, so a `builderRfPerQuarry` of
+/// 300 costs 150 RF per voided cell. Energy is not carried by this port (gap 10); the constant
+/// records the jar's measured value so a later energy slice need not guess it.
+pub const VOID_RF_FACTOR: f64 = 0.5;
 /// `commonQuarryBlock`'s own guard: a 3×3×3 box around the Builder is never quarried.
 pub const BUILDER_CELLS: i32 = 1;
 /// `BuilderTileEntity.DONT_REMOVE_ME`, a block tag upstream creates and ships no members
@@ -187,6 +192,10 @@ pub struct Quarry {
     pub fortune: bool,
     /// `isClearing()`: leave air behind instead of the replacement block.
     pub clearing: bool,
+    /// `ShapeCardType.CARD_VOID`: the `voidBlock` handler voids every breakable cell instead of
+    /// rolling its drops. The jar has no `isVoid()` flag — the handler is a different enum
+    /// constant — so this field is how the one card item this port carries names that constant.
+    pub voids: bool,
 }
 
 /// The card's type: upstream's `ShapeCardType`, which the jar reads from the **item id**
@@ -390,44 +399,68 @@ impl Default for Card {
 }
 
 impl Quarry {
-    /// The six `CARD_QUARRY*` constants, in the jar's enum order.
+    /// The six `CARD_QUARRY*` constants, in the jar's enum order, followed by `CARD_VOID`
+    /// (the seventh card type this port carries).
     pub const ALL: &'static [Quarry] = &[
         Quarry {
             silk: false,
             fortune: false,
             clearing: false,
+            voids: false,
         },
         Quarry {
             silk: true,
             fortune: false,
             clearing: false,
+            voids: false,
         },
         Quarry {
             silk: false,
             fortune: true,
             clearing: false,
+            voids: false,
         },
         Quarry {
             silk: false,
             fortune: false,
             clearing: true,
+            voids: false,
         },
         Quarry {
             silk: true,
             fortune: false,
             clearing: true,
+            voids: false,
         },
         Quarry {
             silk: false,
             fortune: true,
             clearing: true,
+            voids: false,
         },
+        Self::VOID,
     ];
+
+    /// `ShapeCardType.CARD_VOID`: resourceSuffix `void`, quarry=false, clearing=false,
+    /// fortune=false, handler `BuilderTileEntity::voidBlock`, HUD `"    Void mode"` and
+    /// `voidShapeCardFactor = 0.5` ([`VOID_RF_FACTOR`]). Voids every breakable cell instead of
+    /// collecting its drops; the port uses the already-tested [`QuarryStep::Void`] path, which
+    /// leaves the Builder's replacement block behind (a deliberate difference from the jar's
+    /// `voidBlock`, which writes air — recorded in `notes.md`).
+    pub const VOID: Quarry = Quarry {
+        silk: false,
+        fortune: false,
+        clearing: false,
+        voids: true,
+    };
 
     /// The card type's resource suffix (`ShapeCardType.getResourceSuffix`), which is the
     /// tail of the jar's item id (`rftoolsbuilder:shape_card_quarry_silk`).
     #[must_use]
     pub fn suffix(self) -> &'static str {
+        if self.voids {
+            return "void";
+        }
         match (self.clearing, self.silk, self.fortune) {
             (false, false, false) => "quarry",
             (false, true, _) => "quarry_silk",
@@ -438,8 +471,8 @@ impl Quarry {
         }
     }
 
-    /// The quarry type a suffix names; the jar's item id (`shape_card_quarry_silk`) reads
-    /// too. `None` for anything that is not one of the six.
+    /// The card type a suffix names; the jar's item id (`shape_card_quarry_silk`) reads
+    /// too. `None` for anything that is not one of the seven.
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
         let wanted = bare_name(name);
@@ -449,10 +482,14 @@ impl Quarry {
             .find(|quarry| quarry.suffix() == wanted)
     }
 
-    /// The header the HUD log prints (`hudLogEntry`), which the readout reuses.
+    /// The header the HUD log prints (`hudLogEntry`), which the readout reuses. The jar's
+    /// `CARD_VOID` entry is `"    Void mode"`; like the other entries, the four leading spaces
+    /// are dropped for the readout.
     #[must_use]
     pub fn description(self) -> &'static str {
-        if self.fortune {
+        if self.voids {
+            "Void mode"
+        } else if self.fortune {
             "Fortune quarry"
         } else if self.silk {
             "Silktouch quarry"
@@ -472,8 +509,8 @@ impl CardKind {
         }
     }
 
-    /// The card type a name names: the six quarry suffixes, or the plain shape card
-    /// (`shape`, `def`, `shape_card_def`).
+    /// The card type a name names: the six quarry suffixes plus `void`, or the plain shape
+    /// card (`shape`, `def`, `shape_card_def`).
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
         if matches!(bare_name(name), "shape" | "def") {
@@ -583,7 +620,9 @@ pub fn quarry_step(quarry: Quarry, facts: CellFacts) -> QuarryStep {
     if !quarry.clearing && facts.is_replacement {
         return QuarryStep::Skip(SkipReason::Replacement);
     }
-    if facts.voided {
+    // `CARD_VOID`'s `voidBlock` — every breakable cell goes down the same no-drops path the
+    // quarry's void list uses; no per-material list is consulted for this type.
+    if quarry.voids || facts.voided {
         return QuarryStep::Void;
     }
     QuarryStep::Harvest
@@ -2059,6 +2098,7 @@ mod tests {
                 silk: false,
                 fortune: false,
                 clearing: false,
+                voids: false,
             },
         ),
         (
@@ -2067,6 +2107,7 @@ mod tests {
                 silk: true,
                 fortune: false,
                 clearing: false,
+                voids: false,
             },
         ),
         (
@@ -2075,6 +2116,7 @@ mod tests {
                 silk: false,
                 fortune: true,
                 clearing: false,
+                voids: false,
             },
         ),
         (
@@ -2083,6 +2125,7 @@ mod tests {
                 silk: false,
                 fortune: false,
                 clearing: true,
+                voids: false,
             },
         ),
         (
@@ -2091,6 +2134,7 @@ mod tests {
                 silk: true,
                 fortune: false,
                 clearing: true,
+                voids: false,
             },
         ),
         (
@@ -2099,6 +2143,7 @@ mod tests {
                 silk: false,
                 fortune: true,
                 clearing: true,
+                voids: false,
             },
         ),
     ];
@@ -2191,6 +2236,69 @@ mod tests {
                 "{quarry:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_void_card_is_the_jars_seventh_card_type() {
+        // `ShapeCardType.CARD_VOID` (branch 1.21_neo @ 409049466): resourceSuffix `void`,
+        // quarry=false, clearing=false, fortune=false, SingleBlockHandler `voidBlock`, HUD
+        // `"    Void mode"` (four leading spaces, stripped here as for every other hudLogEntry),
+        // and BuilderConfiguration.voidShapeCardFactor = 0.5 (0..1,000,000).
+        let void = Quarry::VOID;
+        assert_eq!(void.suffix(), "void");
+        assert_eq!(Quarry::parse("void"), Some(void));
+        assert_eq!(
+            Quarry::parse("shape_card_void"),
+            Some(void),
+            "the jar's item id reads too"
+        );
+        assert_eq!(CardKind::parse("void"), Some(CardKind::Quarry(void)));
+        assert_eq!(CardKind::Quarry(void).suffix(), "void");
+        assert_eq!(void.description(), "Void mode");
+        assert_eq!(VOID_RF_FACTOR, 0.5, "builderRfPerQuarry x 0.5 = 150 RF");
+        assert!(!void.clearing && !void.fortune && !void.silk);
+        assert_eq!(Shape::parse("void"), None, "a card type, not a shape");
+    }
+
+    #[test]
+    fn a_void_card_voids_every_breakable_cell() {
+        let void = Quarry::VOID;
+        let facts = |near_builder, air, destroy_speed, is_replacement| CellFacts {
+            near_builder,
+            air,
+            destroy_speed,
+            is_replacement,
+            voided: false,
+        };
+        // The jar's voidBlock keeps the same early guards as the quarry: its own 3x3x3, air,
+        // an unbreakable block and the replacement it left on a previous pass.
+        assert_eq!(
+            quarry_step(void, facts(true, false, 2.0, false)),
+            QuarryStep::Skip(SkipReason::NearBuilder)
+        );
+        assert_eq!(
+            quarry_step(void, facts(false, true, 0.0, false)),
+            QuarryStep::Skip(SkipReason::Empty)
+        );
+        assert_eq!(
+            quarry_step(void, facts(false, false, -1.0, false)),
+            QuarryStep::Skip(SkipReason::Unbreakable)
+        );
+        assert_eq!(
+            quarry_step(void, facts(false, false, 2.0, true)),
+            QuarryStep::Skip(SkipReason::Replacement),
+            "a second pass over its own replacement does not void again"
+        );
+        // Every other cell is voided — no per-material list is consulted for this type.
+        assert_eq!(
+            quarry_step(void, facts(false, false, 2.0, false)),
+            QuarryStep::Void
+        );
+        // A normal quarry on the same facts harvests: the card type, not the rig, changes it.
+        assert_eq!(
+            quarry_step(QUARRY_TYPES[0].1, facts(false, false, 2.0, false)),
+            QuarryStep::Harvest
+        );
     }
 
     #[test]
@@ -2361,6 +2469,32 @@ mod tests {
             "Builder at 10 64 10: Box (Solid) 3x3x3 offset 6 0 0, 27 cells, \
              quarry (Silktouch quarry), replacing with minecraft:dirt, 3 quarried, \
              refused at 17 64 10: no room for the drops (put a container above or below the builder)"
+        );
+    }
+
+    #[test]
+    fn a_void_readout_names_the_void_mode_and_counts_every_cell_as_voided() {
+        let line = status_line(&Status {
+            at: [22, 102, -7],
+            card: Some(quarry_card(Quarry::VOID)),
+            refused_card: None,
+            progress: Progress {
+                placed: 27,
+                skipped: 0,
+                voided: 27,
+            },
+            refusal: None,
+            complete: true,
+            cells: Some(CellCount {
+                cells: 27,
+                more: false,
+            }),
+            replace: "minecraft:dirt".to_owned(),
+        });
+        assert_eq!(
+            line,
+            "Builder at 22 102 -7: Box (Solid) 3x3x3 offset 6 0 0, 27 cells, \
+             quarry (Void mode), replacing with minecraft:dirt, 27 quarried, 27 voided, scan complete"
         );
     }
 

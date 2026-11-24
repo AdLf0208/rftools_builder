@@ -35,8 +35,12 @@
 #       type and void list when it is taken out and put back; with tag matching off
 #       the coarse dirt is collected again; `/rftoolsbuilder replace` changes what the
 #       quarry leaves behind; and a box card on the same rig collects nothing;
-#   13. the Builder's loot table drops it when broken with an iron pickaxe;
-#   14. `/rftoolsbuilder reset` returns the held card to the jar's default solid
+#   13. the VOID card type: over the same rig with 27 stone it leaves 27 dirt and
+#       collects nothing (status `27 quarried, 27 voided`), and a normal quarry
+#       card on the same rig still collects all 27 — the card type is the only
+#       difference between the two outcomes;
+#   14. the Builder's loot table drops it when broken with an iron pickaxe;
+#   15. `/rftoolsbuilder reset` returns the held card to the jar's default solid
 #       5x5x5 box, read back with `status` as 125 cells.
 #
 # COUNTERFACTUAL=1 puts a vanilla furnace where the Builder goes: the card's
@@ -47,7 +51,9 @@
 # SELFTEST=1 keeps the scenario and asserts 26 SOLID cells for the 3×3×3 box
 # (the box has 27), so the run MUST end in `FAIL:`: the count is not vacuous.
 # SELFTEST=quarry flips the quarry's replacement assertion (it expects cobblestone
-# where the pass writes dirt), so that run MUST end in `FAIL:` too.
+# where the pass writes dirt), so that run MUST end in `FAIL:` too. SELFTEST=void
+# flips the void card's "chest unchanged" assertion to "one cobblestone collected",
+# so that run MUST end in `FAIL:` too.
 #
 # The mod is one flat `.hmod` the launcher compiles into the game, so GAME must
 # name a game the launcher built with it. The Builder's recipe needs
@@ -746,6 +752,53 @@ echo "$line" | grep -q "quarry (Fortune quarry), replacing with minecraft:cobble
 [ "$fortune_gravel" -eq 0 ] || fail "the fortune quarry left gravel instead of flint ($fortune_gravel)"
 [ "$fortune_cobble" -eq 130 ] || fail "the fortune pass collected $fortune_cobble cobblestone, expected 130"
 
+say "VOID: a void card voids all 27 cells and collects nothing"
+# The /replace phase set this Builder's replacement to cobblestone; restore the jar's default so
+# the readout and the cells name minecraft:dirt. The volume is 27 stone (no gravel or coarse dirt).
+take_quarry_card
+line=$(answer replace "$QX" "$QY" "$QZ" minecraft:dirt)
+echo "replace: $line"
+echo "$line" | grep -q "Builder replacement set to minecraft:dirt" || fail "the replacement: $line"
+fill_volume 0 0
+void_before=$(chest_total "$QX" $((QY + 1)) "$QZ")
+install_quarry_card void off
+line=$(status "$QX" "$QY" "$QZ")
+echo "void status: $line"
+echo "$line" | grep -q "quarry (Void mode), replacing with minecraft:dirt" \
+    || fail "the void readout does not name its type and replacement: $line"
+ctl wait 120 >/dev/null
+line=$(status "$QX" "$QY" "$QZ")
+echo "void status: $line"
+echo "$line" | grep -q "27 cells, quarry (Void mode), replacing with minecraft:dirt, 27 quarried, 27 voided, scan complete" \
+    || fail "the void pass did not finish over 27 cells: $line"
+if ! volume_all minecraft:dirt; then
+    fail "the void card did not replace the 27 cells with minecraft:dirt ($(volume_cells | awk '$4 != "minecraft:dirt"' | wc -l) cells differ)"
+fi
+void_after=$(chest_total "$QX" $((QY + 1)) "$QZ")
+# The chest the Builder reads is untouched: the void path writes the replacement but rolls no
+# drops. SELFTEST=void expects one cobblestone, so the unchanged chest makes that leg exit 1.
+void_expected=$void_before
+[ "$SELFTEST" = void ] && void_expected=$((void_before + 1))
+echo "void: chest total $void_before -> $void_after (expected $void_expected)"
+[ "$void_after" -eq "$void_expected" ] \
+    || fail "the void card moved $((void_after - void_before)) items; expected $((void_expected - void_before))"
+
+say "VOID CONTROL: a normal quarry card on the same rig still collects all 27"
+take_quarry_card
+fill_volume 0 0
+normal_before=$(chest_total "$QX" $((QY + 1)) "$QZ")
+install_quarry_card quarry off
+ctl wait 120 >/dev/null
+line=$(status "$QX" "$QY" "$QZ")
+echo "quarry status: $line"
+echo "$line" | grep -q "27 cells, quarry (Normal quarry), replacing with minecraft:dirt, 27 quarried, scan complete" \
+    || fail "the normal quarry on the void rig did not finish: $line"
+normal_after=$(chest_total "$QX" $((QY + 1)) "$QZ")
+echo "quarry: chest total $normal_before -> $normal_after"
+[ "$normal_after" -eq $((normal_before + 27)) ] \
+    || fail "the quarry collected $((normal_after - normal_before)) items, expected 27"
+volume_all minecraft:dirt || fail "the quarry did not replace the 27 cells"
+
 say "CONTROL: the same rig with a box card collects nothing"
 take_quarry_card
 ctl command "clear @a" >/dev/null
@@ -837,4 +890,4 @@ cards=$(count_item "$CARD")
 echo "cards in the inventory after reset: $cards"
 [ "$cards" -eq 1 ] || fail "the reset consumed the card ($cards left)"
 
-echo "PASS: both carried recipes craft in a real crafting table (the shape card from 4 paper, 2 bricks, 1 iron ingot and 2 redstone; the Builder from 4 bricks, an ender pearl, 3 redstone and a machine frame) with their ingredients consumed and their wrong-ingredient controls empty, the game log has no rejected ingredient, the Builder fills its 3x3x3 box from the chest above it (24 placed, 64 -> 40), a hollow 5x5x5 is a 98-cell shell (92 placed against a full chest), a box outside the world border builds 0 and spends nothing, a quarry card over 27 cells breaks them and leaves the configured replacement (25 cobblestone collected, the gravel and the tag-matched coarse dirt voided and not collected), the quarry card keeps its type and void list when it is taken out and put back, tag matching off collects the coarse dirt again, /rftoolsbuilder replace changes the replacement, a box card on the same rig collects nothing, the Builder's loot table drops it, the card goes in, comes back out, resets to the 5x5x5 default, and the placed volume survives a relaunch"
+echo "PASS: both carried recipes craft in a real crafting table (the shape card from 4 paper, 2 bricks, 1 iron ingot and 2 redstone; the Builder from 4 bricks, an ender pearl, 3 redstone and a machine frame) with their ingredients consumed and their wrong-ingredient controls empty, the game log has no rejected ingredient, the Builder fills its 3x3x3 box from the chest above it (24 placed, 64 -> 40), a hollow 5x5x5 is a 98-cell shell (92 placed against a full chest), a box outside the world border builds 0 and spends nothing, a quarry card over 27 cells breaks them and leaves the configured replacement (25 cobblestone collected, the gravel and the tag-matched coarse dirt voided and not collected), the quarry card keeps its type and void list when it is taken out and put back, tag matching off collects the coarse dirt again, /rftoolsbuilder replace changes the replacement, a void card over 27 stone leaves 27 dirt with 27 quarried and 27 voided and collects nothing while a normal quarry card on the same rig collects all 27, a box card on the same rig collects nothing, the Builder's loot table drops it, the card goes in, comes back out, resets to the 5x5x5 default, and the placed volume survives a relaunch"

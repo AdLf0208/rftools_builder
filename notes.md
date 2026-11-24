@@ -27,14 +27,15 @@ One flat `.hmod` — `horizon-mod.toml` + `Cargo.toml` + `src/` + `assets/` +
 
 Status: **ported-partial** — slice 1 (the Builder's shaped mode with its shape
 cards), slice 2 (the carried recipes repaired to the 26.3 dialect and proven in
-game) and slice 3 (the quarry card type, its void list and the replacement block)
-are implemented, their 35 runtime tests and 10 glue tests (45 in all) are green, the
-SDK gate is green, and the package is **verified in a launcher-built game**: the
-modded leg passes every phase including the quarry's, the unmodded control and both
-selftest legs fail. The gap list below is the rest of the mod.
+game), slice 3 (the quarry card type, its void list and the replacement block) and
+slice 4 (`CARD_VOID`) are implemented, their 38 runtime tests and 10 glue tests
+(48 in all) are green, the SDK gate is green, and the package is **verified in a
+launcher-built game**: the modded leg passes every phase including the quarry's and
+the void card's, the unmodded control and the three selftest legs fail. The gap list
+below is the rest of the mod.
 
-Package at **0.2.3**: **69,798 B**, SHA-256
-`9efbb76f1a8092a217c81410ebc58f55b0e1a9691841f43d90183e0ee66da8b9`, built twice byte-identically against SDK **`0a875da9…`** + mixins
+Package at **0.2.4**: **71,421 B**, SHA-256
+`de192fadf0fd60fef23fadeb5a8db84ef4e08ae989937702838003c92447c5f6`, built twice byte-identically against SDK **`0a875da9…`** + mixins
 `e59da90…` (`check` exit 0, `fits` `made for` at the pin and `fits` at `0b14f8a`).
 The command → exact-output → log table for every number below is
 [`VALIDATION.md`](VALIDATION.md); the canonical logs are `sdk-test.log`,
@@ -747,6 +748,140 @@ e2e (the remote runner has neither the subcommand nor the prepared 26.3 resource
 | in-game | the four legs above, on the launcher-built two-package game (0.2.3) | `PASS` + `EXIT:0`; control, `SELFTEST=1` and `SELFTEST=quarry` `EXIT:1` | `../_shared/evidence/rftoolsbuilder-e2e/*.log` |
 | log gate | `check-e2e-logs.py rftoolsbuilder-e2e --strict` | `logs=8 ok=8 missing-exit=0 bad-exit=0`, exit 0 | — |
 
+## Slice 4 (0.2.4, 2026-11-24) — `CARD_VOID`
+
+The gap line this slice answers, verbatim from *Gaps* 2: *"What is left is the jar's
+*resource scan* (`ShapeHandler`/`scanId`) — nothing in this slice needs it, the quarry
+reads the world cell by cell — and `CARD_VOID`."* It fits `deep` exactly as slice 3
+did: a seventh card-type constant and a rule in the Builder's existing tick, with
+no new block, item, recipe, registration or renderer.
+
+### What the jar says — read, not guessed
+
+`javap -c -p` over the jar's own class files (`/tmp/opencode/rfb-jar-read`, jar
+`rftoolsbuilder-1.21-7.0.8.jar`, 1,054,376 B):
+
+- `ShapeCardType.class` static initializer for `CARD_VOID`: ordinal 3, `resourceSuffix`
+  `"void"`, three `iconst_0` (quarry=false, clearing=false, fortune=false), handler
+  `voidBlock`, and the HUD constant **`"    Void mode"`** (four leading spaces —
+  `ldc_w #337 // String     Void mode`); the constructor reads `hudLogEntry`.
+- `BuilderConfiguration.class` `init`, bytecode `ldc2_w #183 // double 0.5d` under the
+  comment string "The RF per operation of the builder is multiplied with this factor
+  when using the void shape card" and the key `voidShapeCardFactor` (range 0..1,000,000):
+  the factor is **`0.5`**, so `builderRfPerQuarry` 300 × 0.5 = **150 RF** per cell.
+- `BuilderTileEntity.class` `voidBlock(int, BlockPos, BlockState, BlockState)`:
+  skips the Builder's own ±1 box, calls `allowedToBreak`, then sets the cell to
+  `Blocks.AIR` and consumes the per-cell RF; **no drops are inserted**.
+
+The upstream repository could not be cloned on this box (GitHub connection reset),
+so these three values come from the jar's constant pool, the artefact the port is
+judged against.
+
+### What the port carries, and the one deliberate difference
+
+- **`Quarry::VOID`** (the seventh `CardKind::Quarry` constant): `suffix() == "void"`,
+  `parse("void")`/`parse("shape_card_void")` round-trip through the existing component,
+  `description() == "Void mode"` (the jar's four HUD spaces are dropped as for every
+  other entry), and `VOID_RF_FACTOR = 0.5` is a documented constant for a later energy
+  slice (energy itself is gap 10).
+- **The rule**: `quarry_step` keeps the jar's early guards (Builder's box, air,
+  unbreakable, replacement) and sends every other cell down the **already unit-tested
+  `QuarryStep::Void` path** — remove the block, write the Builder's replacement block,
+  count it as `voided`, collect nothing.
+- **The surface**: `/rftoolsbuilder type void` (the usage/help and the unknown-type list
+  name it); `/rftoolsbuilder status` prints `quarry (Void mode), replacing with … ,
+  27 quarried, 27 voided, scan complete`.
+- **Deviation (deliberate, recorded):** the jar's `voidBlock` writes `minecraft:air`;
+  this port reuses the void-list path, which writes the Builder's replacement block
+  (default `minecraft:dirt`). The user-visible contract is "nothing is collected" —
+  both do that — but the cell afterwards differs. Choosing the tested Void path keeps
+  one void rule for the void list and the void card; reproducing the jar's air here
+  would need a second, untested write path. (Gap 10 means there is no RF to compare.)
+
+### Red → green
+
+- **Red (before the code existed):** the three new tests written first —
+  `the_void_card_is_the_jars_seventh_card_type`, `a_void_card_voids_every_breakable_cell`
+  and `a_void_readout_names_the_void_mode_and_counts_every_cell_as_voided` — failed to
+  compile (`evidence/rftoolsbuilder/red-void-compile.log`):
+
+  ```
+  error[E0425]: cannot find value `VOID_RF_FACTOR` in this scope
+  error[E0599]: no associated item named `VOID` found for struct `runtime::Quarry` in the current scope
+  error: could not compile `rftoolsbuilder` (lib test) due to 4 previous errors
+  TEST_EXIT:101
+  ```
+
+- **Green:** `cargo test --offline` → `running 48 tests` · `test result: ok. 48 passed;
+  0 failed` (`sdk-test.log`, regenerated for 0.2.4: 38 runtime + 10 glue).
+
+### In game (0.2.4)
+
+Quoted from `../_shared/evidence/rftoolsbuilder-e2e/e2e-package.log` — the void phase
+runs on the quarry rig after the `/replace` phase restored this Builder's replacement
+to `minecraft:dirt` and the volume was refilled with 27 stone:
+
+```
+== VOID: a void card voids all 27 cells and collects nothing ==
+replace: Builder replacement set to minecraft:dirt
+quarry card: Builder at 9 102 -14: Box (Solid) 3x3x3 offset 6 0 0, 27 cells, quarry (Void mode), replacing with minecraft:dirt, 27 quarried, 27 voided, scan complete
+void status: Builder at 9 102 -14: Box (Solid) 3x3x3 offset 6 0 0, 27 cells, quarry (Void mode), replacing with minecraft:dirt, 27 quarried, 27 voided, scan complete
+void: chest total 159 -> 159 (expected 159)
+== VOID CONTROL: a normal quarry card on the same rig still collects all 27 ==
+quarry status: Builder at 9 102 -14: ... quarry (Normal quarry), replacing with minecraft:dirt, 27 quarried, scan complete
+quarry: chest total 159 -> 186
+```
+
+Every cell reads `minecraft:dirt` (the phase's `volume_all` checks all 27), the chest
+is unchanged, and the normal-quarry differential on the *same* rig gains exactly 27
+items — so the card type, not the rig, changes the outcome. `SELFTEST=void` flips the
+chest expectation to `+1` and exits 1 at `FAIL: the void card moved 0 items; expected 1`.
+
+| leg | result | log |
+|---|---|---|
+| package | **`PASS`** + `EXIT:0` | `../_shared/evidence/rftoolsbuilder-e2e/e2e-package.log` |
+| unmodded control | `FAIL: cannot give rftoolsbuilder:builder: this game does not carry the package` + `EXIT:1` | `e2e-control.log` |
+| `SELFTEST=1` | `FAIL: built 24 cells, expected 25` + `EXIT:1` | `e2e-selftest.log` |
+| `SELFTEST=quarry` | `FAIL: the quarry did not replace the 27 cells with minecraft:cobblestone (27 cells differ)` + `EXIT:1` | `e2e-quarry-selftest.log` |
+| `SELFTEST=void` | `FAIL: the void card moved 0 items; expected 1` + `EXIT:1` | `e2e-void-selftest.log` |
+| log gate | `check-e2e-logs.py rftoolsbuilder-e2e --strict` | `logs=9 ok=9 missing-exit=0 bad-exit=0` |
+
+**Coverage — the void card's families:**
+
+| family | status | proof |
+|---|---|---|
+| the seventh card type (`void` suffix, id, parse, HUD words, 0.5 factor) | **tested** | unit: `the_void_card_is_the_jars_seventh_card_type`; in game: `/rftoolsbuilder type void` is accepted and the readout names `Void mode` |
+| `voidBlock`'s early guards (own box, air, unbreakable, replacement) | **tested** | unit: `a_void_card_voids_every_breakable_cell`; the 27-stone pass voids all 27 and a second pass over its own replacement voids none |
+| no drops collected | **tested** | in game: chest total `159 -> 159`, and `SELFTEST=void` (expects +1) exits 1 |
+| the replacement block left behind (the port's deliberate difference from the jar's air) | **tested** | `volume_all minecraft:dirt` over all 27 cells; byte-stable readout in `a_void_readout_names_the_void_mode_and_counts_every_cell_as_voided` |
+| differential against a normal quarry on the same rig | **tested** | the same 27-stone volume with a `quarry` card collects 27 items (`159 -> 186`) |
+| the jar's resource scan (`ShapeHandler`/`scanId`) | **not ported** | nothing in this slice needs it (gap 2, unchanged) |
+
+### Ladder (0.2.4)
+
+Every Rust step ran through `ports/tools/build-slot.sh` with the **relative**
+`--port ports/rftoolsbuilder`, job `G11-rftoolsbuilder`, `CARGO_INCREMENTAL=0`; the
+forwarding line was `build-slot: forwarding <step> for ports/rftoolsbuilder to the
+remote runner` and the remote host answered `AdLf-PC`. The `horizon-launcher` game
+build and all e2e legs ran locally (the remote has no launcher, prepared 26.3
+resources or `jq`) — `BUILD_LOCAL=1` only for that genuinely local step; the e2e legs
+need no opt-out because `--step e2e` is not forwarded.
+
+| Step | Command | Result | Log |
+|---|---|---|---|
+| red | `cargo test --offline`, three new tests first | `error[E0425]…`, `error[E0599]…`, `due to 4 previous errors`, `TEST_EXIT:101` | `red-void-compile.log` |
+| unit tests | `cargo test --offline` | `running 48 tests` · `48 passed; 0 failed`, doc-tests 0 | `sdk-test.log` |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | `CLIPPY_EXIT:0`, 0 warnings | `clippy.log` |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | `FMT_EXIT:0` | `fmt.log` |
+| SDK gate | `cargo horizon-mod check` | 481 API items, `Made for 0a875da.`, `CHECK_EXIT:0` | `check.log` |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | **`cmp` identical**, 71,421 B | `build.log`, `build2.log` |
+| registry check | `cargo horizon-mod check rftoolsbuilder.hmod` | `rftoolsbuilder 0.2.4 (native-mod, format native-1/0a875da…/e59da90…, for 26.3)`, `FILE_CHECK_EXIT:0` | `file-check-fits.log` |
+| fits, the pin | `cargo horizon-mod fits rftoolsbuilder.hmod --build 0a875da…` | `0a875da  made for`, `FITS_PIN_EXIT:0` | `sdk-fits.log` |
+| fits, a different build | `… --build 0b14f8a…` | `0b14f8a  fits`, `FITS_OTHER_EXIT:0` | `sdk-fits-other.log` |
+| package gate | `python3 ports/tools/verify-sdk-package.py rftoolsbuilder` | **1/1** (`runtime byte-identical 1a4dce1e059c`, `package matches the tree`, R9 clean, 31 entries, no packed `Cargo.lock`) | — |
+| game build | `bundle-game.sh` (local: no launcher on the remote) | `Compiling rftoolsbase (1 of 2)` / `Compiling rftoolsbuilder (2 of 2)`, `native-0a875da-2a85c3595f8a` | `../rftoolsbuilder-e2e/bundle-game-build.log` |
+| in-game | the five legs above | `PASS` + `EXIT:0`; control and three selftests `EXIT:1` | `../rftoolsbuilder-e2e/*.log` |
+
 ## Gaps
 
 1. ~~**No in-game run.**~~ **Closed 2026-11-21**: `ports/tools/launcher-game.sh` and
@@ -759,7 +894,10 @@ e2e (the remote runner has neither the subcommand nor the prepared 26.3 resource
    2026-11-23** (slice 3): the six card types, the three drop paths, the void list
    with tag matching, the replacement block. What is left is the jar's *resource
    scan* (`ShapeHandler`/`scanId`) — nothing in this slice needs it, the quarry
-   reads the world cell by cell — and `CARD_VOID`. Chunk loading stays as gap 12.
+   reads the world cell by cell — and `CARD_VOID`. **CARD_VOID carried 2026-11-24**
+  (slice 4, 0.2.4: the seventh card type, the 0.5 factor and the `"    Void mode"`
+  HUD string read from the jar; its deliberate replacement-block difference is in
+  the slice-4 section). Chunk loading stays as gap 12.
 3. **The movers**, their controls and the vehicle builder (`modules/mover`).
 4. **The shields** and their renderer (`modules/shield`).
 5. **The space chamber**, copy/move/swap modes, support blocks and the entity
@@ -790,8 +928,8 @@ e2e (the remote runner has neither the subcommand nor the prepared 26.3 resource
 
 ## Verification
 
-Slice 1's run (0.2.0) is the table below; the current **0.2.3** numbers are in
-*Ladder (0.2.3)* in the slice-3 section above, and the file-level record is
+Slice 1's run (0.2.0) is the table below; the current **0.2.4** numbers are in
+*Ladder (0.2.4)* in the slice-4 section above, and the file-level record is
 [`VALIDATION.md`](VALIDATION.md).
 
 Every command ran through `ports/tools/build-slot.sh` (one lease per step); logs
@@ -835,10 +973,25 @@ Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-de
 ## Publishing
 
 MIT, rank 0. The current artifact is `ports/rftoolsbuilder/rftoolsbuilder.hmod`
-(**69,798 B**, `9efbb76f1a8092a217c81410ebc58f55b0e1a9691841f43d90183e0ee66da8b9`), version **0.2.3** — an **update** of the entry
-this campaign owns (`Add rftoolsbuilder 0.2.0`, PR #1276, then 0.2.2 merged), so the
-PR title is `Update rftoolsbuilder 0.2.3` and the body names the superseded PR.
-Publishing still needs the maintainer's approval (ARCHITECTURE.md §8).
+(**71,421 B**, `de192fadf0fd60fef23fadeb5a8db84ef4e08ae989937702838003c92447c5f6`), version **0.2.4** — an **update** of the entry
+this campaign owns (`Add rftoolsbuilder 0.2.0`, PR #1276, then 0.2.2 merged; 0.2.3
+staged on PR #1827), so the PR title is `Update rftoolsbuilder 0.2.4` and the body
+names the superseded PR. Publishing still needs the maintainer's approval
+(ARCHITECTURE.md §8).
+
+**Changelog (0.2.4) — supersedes 0.2.3:**
+
+- **The void card type**: `/rftoolsbuilder type void` selects the jar's seventh
+  card type (`CARD_VOID`, suffix `void`, `voidBlock`, HUD `"    Void mode"`,
+  `voidShapeCardFactor = 0.5`). It voids every breakable cell of the card's box:
+  nothing is collected, the replacement block is left behind and the readout says
+  `27 quarried, 27 voided`. Deliberate difference from the jar: the port reuses its
+  tested void-list path, which writes the replacement block where `voidBlock`
+  writes air (recorded in the slice-4 section).
+- 48 tests (was 45), clippy `-D warnings` clean, `check` 0, `fits` `made for` at the
+  pin and `fits` at `0b14f8a`; in game `PASS` + `EXIT:0` with the void phases, the
+  unmodded control `EXIT:1`, `SELFTEST=1` `EXIT:1`, `SELFTEST=quarry` `EXIT:1` and
+  the new `SELFTEST=void` `EXIT:1`; `check-e2e-logs.py --strict` 9/9.
 
 **Changelog (0.2.3) — supersedes 0.2.2:**
 
