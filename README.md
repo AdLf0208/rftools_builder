@@ -48,6 +48,16 @@ A Horizon native mod (mod API 0.2) that ports **RFTools Builder 1.21-7.0.8**
   released when the pass ends or the card is removed, so another Builder in the
   same chunk must force it for itself. `/rftoolsbuilder forced <pos>` reads the
   chunks a Builder's ticket actually holds from the game's ticket table.
+- **Energy**: the Builder declares an FE buffer (`builderMaxRF` 1,000,000, taking
+  up to `builderRFPerTick` 20,000 a call) whose amount lives in its saved compound
+  under `energy`, as upstream's `GenericEnergyStorage` does. A shaped cell costs
+  `builderRfPerOperation` 500 FE, a quarry cell `builderRfPerQuarry` 300 FE, and a
+  void card `builderRfPerOperation × voidShapeCardFactor` 250 FE; with no infuser
+  the infusion multiplier is 1. A buffer that cannot pay suspends at that cell
+  (`not enough power`) without placing, breaking or collecting anything.
+  `/rftoolsbuilder energy <pos>` reads the buffer, lifetime spend and per-cell
+  costs back; `/rftoolsbuilder charge <pos> <amount>` fills it through the block's
+  energy capability (a harness stand-in for a cable).
 - **`/rftoolsbuilder status <pos>`** reads a Builder out: its card type, shape,
   size, offset, cell count, the replacement block, the void list, progress, and
   the first cell it refused and why.
@@ -57,9 +67,11 @@ A Horizon native mod (mod API 0.2) that ports **RFTools Builder 1.21-7.0.8**
 ## What it does not do
 
 The movers and their controls, the shields, the space chamber, the composer, the
-projector, the scanner, the GUI screens, the liquid/pump cards, the filter module
-and energy are **not** carried. The `GAPS` list in `notes.md` names each with the
-upstream file that implements it.
+projector, the scanner, the GUI screens, the liquid/pump cards and the filter
+module are **not** carried. The per-block hardness multiplier, card-type cost
+factors beyond the void card, and the infuser itself are also out of scope: the
+port charges the jar's base per-cell cost. The `GAPS` list in `notes.md` names
+each with the upstream file that implements it.
 
 ## Building
 

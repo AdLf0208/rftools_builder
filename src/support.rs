@@ -15,17 +15,18 @@ use std::sync::OnceLock;
 use mod_api::{
     self, BlockEntityEvent, BlockEntityPart, BlockEntityRef, BlockEntityTickEvent,
     BlockEntityTicksEvent, BlockKey, BlockPart, BlockState, BlockUpdateFlags, Capability, Command,
-    CommandArgumentValue, Component, Compound, Flow, Hand, Host, HostBlockStates, HostSide,
+    CommandArgumentValue, Component, Compound, ENERGY, Flow, Hand, Host, HostBlockStates, HostSide,
     HostTransaction, ITEMS, Identifier, InteractionResult, ItemPart, ItemResource, ItemStack,
-    LevelRef, LevelSide, ModContainer, PlayerRef, RegisterCommandsEvent, Registrar,
-    RegistrationContext, ResourceHandler, RightClickBlockEvent, RunModCommandEvent, ServerHost,
-    SoundSource, Tag, Text, TicketController, TicketOwner, UseOnEvent,
+    LevelRef, LevelSide, ModContainer, ModEnergyBuffer, PlayerRef, RegisterCommandsEvent,
+    Registrar, RegistrationContext, ResourceHandler, RightClickBlockEvent, RunModCommandEvent,
+    ServerHost, SoundSource, Tag, Text, TicketController, TicketOwner, UseOnEvent,
 };
 
 use crate::runtime::{
-    self, BLOCKS_PER_TICK, BUILDER_CELLS, Card, CardKind, CellFacts, DONT_REMOVE_ME, FORTUNE_LEVEL,
+    self, BLOCKS_PER_TICK, BUILDER_CELLS, Card, CardKind, CellCharge, CellFacts, DONT_REMOVE_ME,
+    ENERGY_CAPACITY, ENERGY_MAX_INSERT, EnergyStatus, FORTUNE_LEVEL, INFUSION_FACTOR,
     LOOKUPS_PER_TICK, Progress, QUARRY_REPLACE, QUARRY_TOOL, Quarry, QuarryStep, Refusal,
-    RefusalReason, Scan, Shape, Status, Voiding,
+    RefusalReason, Scan, Shape, Status, Voiding, adjusted_cost, cell_cost, energy_line,
 };
 
 /// The compound key type, taken from `Tag::String`'s own payload: the API does not re-export the
@@ -121,6 +122,11 @@ const K_VOIDED: &str = "voided";
 /// The chunk `[x, z]` a Builder currently force-loads with its ticket (the jar's
 /// `forcedChunk` field), so the ticket can be released when the pass ends.
 const K_FORCED_CHUNK: &str = "forcedChunk";
+/// The Builder's FE, as the jar's `GenericEnergyStorage` writes it: an int `energy` in the
+/// block entity's saved compound, which the `ModEnergyBuffer` capability also reads.
+const K_ENERGY: &str = "energy";
+/// FE this Builder's passes have spent, so `/rftoolsbuilder energy` can report exact consumption.
+const K_ENERGY_SPENT: &str = "energySpent";
 
 /// The card's refusal codes in the saved compound.
 const REFUSAL_NONE: i8 = 0;
@@ -134,6 +140,8 @@ const REFUSAL_PROTECTED: i8 = 3;
 const REFUSAL_NO_ROOM: i8 = 4;
 /// `RefusalReason::Unloaded`.
 const REFUSAL_UNLOADED: i8 = 5;
+/// `RefusalReason::NoPower`.
+const REFUSAL_NO_POWER: i8 = 6;
 
 /// The block key the hooks compare the loaded block against. A `BlockKey` only
 /// names itself through a host, so it is asked for once, at registration.
@@ -194,6 +202,23 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
         ..ModContainer::default()
     };
     registrar.block_container(&block, container);
+    // The jar's `GenericEnergyStorage(1_000_000, 20_000)`: a buffer that takes FE from any
+    // side but gives none out (the Builder has no energy output). Its amount lives in the
+    // saved compound's `energy` int, so a reload keeps it and the tick reads it there (the
+    // capability is deliberately unavailable to a block entity during its own tick).
+    #[expect(
+        clippy::needless_update,
+        reason = "the update is for a field a later game build may add"
+    )]
+    let battery = ModEnergyBuffer {
+        capacity: ENERGY_CAPACITY,
+        max_insert: ENERGY_MAX_INSERT,
+        max_extract: 0,
+        insert_faces: [true; 6],
+        extract_faces: [false; 6],
+        ..ModEnergyBuffer::default()
+    };
+    registrar.block_energy(&block, battery);
     let card = registrar.item_key(CARD_ITEM);
     registrar.item_part(card, ShapeCardItem);
 }
@@ -539,6 +564,9 @@ struct State {
     cells: Option<runtime::CellCount>,
     /// The chunk currently held by the Builder's force-load ticket.
     forced_chunk: Option<[i32; 2]>,
+    /// FE this Builder's passes have spent, as the jar's `GenericEnergyStorage` consumption
+    /// accumulated (the port keeps a lifetime total for the energy readout).
+    energy_spent: u64,
 }
 
 impl State {
@@ -559,6 +587,7 @@ impl State {
             Some(Tag::Byte(code)) if *code == REFUSAL_PROTECTED => Some(RefusalReason::Protected),
             Some(Tag::Byte(code)) if *code == REFUSAL_NO_ROOM => Some(RefusalReason::NoRoom),
             Some(Tag::Byte(code)) if *code == REFUSAL_UNLOADED => Some(RefusalReason::Unloaded),
+            Some(Tag::Byte(code)) if *code == REFUSAL_NO_POWER => Some(RefusalReason::NoPower),
             _ => None,
         }
         .map(|reason| Refusal {
@@ -580,6 +609,7 @@ impl State {
                 more: matches!(nbt.get(&key!(K_CELLS_MORE)), Some(Tag::Byte(1))),
             }),
             forced_chunk: ints2(nbt, K_FORCED_CHUNK),
+            energy_spent: number(K_ENERGY_SPENT).unwrap_or(0),
         }
     }
 
@@ -635,6 +665,7 @@ impl State {
                     RefusalReason::Protected => REFUSAL_PROTECTED,
                     RefusalReason::NoRoom => REFUSAL_NO_ROOM,
                     RefusalReason::Unloaded => REFUSAL_UNLOADED,
+                    RefusalReason::NoPower => REFUSAL_NO_POWER,
                 };
                 nbt.insert(key!(K_REFUSAL), Tag::Byte(code));
                 put_ints(nbt, K_REFUSAL_POS, refusal.at);
@@ -650,7 +681,38 @@ impl State {
                 nbt.remove(&key!(K_FORCED_CHUNK));
             }
         }
+        nbt.insert(
+            key!(K_ENERGY_SPENT),
+            Tag::Long(i64::try_from(self.energy_spent).unwrap_or(i64::MAX)),
+        );
     }
+}
+
+/// The Builder's saved FE (0 when the compound has none), clamped to the jar's buffer capacity.
+fn energy_of(nbt: &Compound) -> u32 {
+    match nbt.get(&key!(K_ENERGY)) {
+        Some(Tag::Int(value)) => (*value).clamp(0, ENERGY_CAPACITY) as u32,
+        _ => 0,
+    }
+}
+
+/// Write the FE back into the saved compound, the key the capability reads too.
+fn set_energy(nbt: &mut Compound, amount: u32) {
+    nbt.insert(key!(K_ENERGY), Tag::Int(amount as i32));
+}
+
+/// Charge one cell's cost to this Builder's buffer. Nothing is written and `false` is returned
+/// when the buffer cannot pay, so a stalled cell never acts for free (`GenericEnergyStorage`'s
+/// `consumeEnergy` after the jar's "Not enough power!" check).
+fn spend(nbt: &mut Compound, spent: &mut u64, base: u32) -> bool {
+    let cost = adjusted_cost(base, INFUSION_FACTOR);
+    let held = energy_of(nbt);
+    if held < cost {
+        return false;
+    }
+    set_energy(nbt, held - cost);
+    *spent += u64::from(cost);
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -869,7 +931,17 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
                 });
                 break;
             }
-            match quarry_cell(host, level, pos, cursor, quarry, &card, &replace) {
+            match quarry_cell(
+                host,
+                level,
+                pos,
+                cursor,
+                quarry,
+                &card,
+                &replace,
+                &mut event.entity.nbt,
+                &mut state.energy_spent,
+            ) {
                 QuarryCell::Skip => state.progress.skipped += 1,
                 QuarryCell::Void => {
                     acted += 1;
@@ -901,6 +973,18 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
                     });
                     break;
                 }
+                QuarryCell::NoPower => {
+                    // The jar's "Not enough power!" suspend: nothing was broken or collected,
+                    // so stay on this cell and wait for FE (a charged rig resumes the pass).
+                    state.refusal = Some(Refusal {
+                        at: cursor,
+                        reason: RefusalReason::NoPower,
+                    });
+                    state.cursor = Some(cursor);
+                    state.write(&mut event.entity.nbt);
+                    *event.reply = mod_api::BlockEntityTickReply::Changed;
+                    return;
+                }
             }
         } else {
             if !level.is_loaded(host, cursor) {
@@ -912,7 +996,14 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
                 break;
             }
             if is_replaceable(host, level, cursor) {
-                match place(host, level, pos, cursor) {
+                match place(
+                    host,
+                    level,
+                    pos,
+                    cursor,
+                    &mut event.entity.nbt,
+                    &mut state.energy_spent,
+                ) {
                     Placed::Yes => {
                         acted += 1;
                         state.progress.placed += 1;
@@ -930,6 +1021,16 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
                         return;
                     }
                     Placed::Rejected => state.progress.skipped += 1,
+                    Placed::NoPower => {
+                        state.refusal = Some(Refusal {
+                            at: cursor,
+                            reason: RefusalReason::NoPower,
+                        });
+                        state.cursor = Some(cursor);
+                        state.write(&mut event.entity.nbt);
+                        *event.reply = mod_api::BlockEntityTickReply::Changed;
+                        return;
+                    }
                 }
             } else {
                 state.progress.skipped += 1;
@@ -973,6 +1074,8 @@ enum QuarryCell {
     NoRoom,
     /// The cell's block could not be read.
     Unreadable,
+    /// The buffer cannot pay for this cell: nothing was broken or collected.
+    NoPower,
 }
 
 /// One quarry cell: the jar's `commonQuarryBlock`, then its `clearOrDirtBlock`.
@@ -982,6 +1085,10 @@ enum QuarryCell {
 /// without removing the block (`BuilderTileEntity.java:1246` inserts, `:1109-1114` returns
 /// on the tag), so a tagged block hands out its drops on every pass while staying in place.
 /// The port skips a tagged block before anything is rolled.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct game input or output the quarry rule reads; a grouping struct used once would add noise"
+)]
 fn quarry_cell(
     host: &mut dyn ServerHost,
     level: LevelRef,
@@ -990,6 +1097,8 @@ fn quarry_cell(
     quarry: Quarry,
     card: &Card,
     replace: &str,
+    nbt: &mut Compound,
+    spent: &mut u64,
 ) -> QuarryCell {
     let Some(block_state) = level.block_state(host, cursor) else {
         return QuarryCell::Unreadable;
@@ -1017,6 +1126,18 @@ fn quarry_cell(
     if host.block_in_tag(block, DONT_REMOVE_ME).unwrap_or(false) {
         return QuarryCell::Skip;
     }
+    // `CARD_VOID` costs builderRfPerOperation × voidShapeCardFactor; the other quarry types
+    // cost builderRfPerQuarry. Check before the drops are inserted so an unpowered cell never
+    // hands out an item while its block stays in place.
+    let base = if quarry.voids {
+        cell_cost(CellCharge::Void)
+    } else {
+        cell_cost(CellCharge::Quarry)
+    };
+    let cost = adjusted_cost(base, INFUSION_FACTOR);
+    if energy_of(nbt) < cost {
+        return QuarryCell::NoPower;
+    }
     let mut collected = false;
     if step == QuarryStep::Harvest {
         if !insert_drops(host, level, builder, cursor, quarry) {
@@ -1024,7 +1145,11 @@ fn quarry_cell(
         }
         collected = true;
     }
+    let _ = spend(nbt, spent, base);
     if !clear_or_replace(host, level, cursor, block_state, quarry.clearing, replace) {
+        // The write was refused: put the FE back rather than charge for a cell that did not act.
+        *spent = spent.saturating_sub(u64::from(cost));
+        set_energy(nbt, energy_of(nbt) + cost);
         return QuarryCell::Skip;
     }
     if collected {
@@ -1192,11 +1317,21 @@ enum Placed {
     NoMaterial,
     /// A block was in reach but the cell took it not.
     Rejected,
+    /// The buffer cannot pay for this cell: no block was taken.
+    NoPower,
 }
 
 /// Places one block into `at`, taking it from the container above the Builder
-/// or, failing that, below it (upstream's `createTakeableItem` order).
-fn place(host: &mut dyn ServerHost, level: LevelRef, builder: [i32; 3], at: [i32; 3]) -> Placed {
+/// or, failing that, below it (upstream's `createTakeableItem` order). A shaped cell costs
+/// `builderRfPerOperation`, charged only after the block was actually written.
+fn place(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    builder: [i32; 3],
+    at: [i32; 3],
+    nbt: &mut Compound,
+    spent: &mut u64,
+) -> Placed {
     let Some(Material {
         handler,
         index,
@@ -1209,6 +1344,11 @@ fn place(host: &mut dyn ServerHost, level: LevelRef, builder: [i32; 3], at: [i32
     let Some(state) = host.block_state_default(block) else {
         return Placed::Rejected;
     };
+    // The jar's `buildBlock` consumes RF after placing; wait before taking a block if the
+    // buffer cannot pay, so an unpowered Builder never hands out material for free.
+    if energy_of(nbt) < adjusted_cost(cell_cost(CellCharge::Build), INFUSION_FACTOR) {
+        return Placed::NoPower;
+    }
     let taken = host
         .transaction(|host, tx| Ok::<u32, ()>(handler.extract(host, tx, index, &resource, 1)))
         .unwrap_or(0);
@@ -1240,6 +1380,7 @@ fn place(host: &mut dyn ServerHost, level: LevelRef, builder: [i32; 3], at: [i32
             sound.pitch,
         );
     }
+    let _ = spend(nbt, spent, cell_cost(CellCharge::Build));
     Placed::Yes
 }
 
@@ -1636,6 +1777,14 @@ pub(crate) fn on_register_commands(event: &mut RegisterCommandsEvent<'_>) {
     event
         .commands
         .push(Command::new("rftoolsbuilder forced <pos:block_pos>"));
+    // The energy readout and the charger (a harness addition, as `/status` is: with no GUI
+    // and no cable in this package, a player otherwise cannot fill the buffer).
+    event
+        .commands
+        .push(Command::new("rftoolsbuilder energy <pos:block_pos>"));
+    event.commands.push(Command::new(
+        "rftoolsbuilder charge <pos:block_pos> <amount:integer>",
+    ));
     event.commands.push(Command::new(
         "rftoolsbuilder shape <shape:word> <dx:integer> <dy:integer> <dz:integer>",
     ));
@@ -1695,6 +1844,29 @@ pub(crate) fn on_run_mod_command(
                 return Flow::Cancel;
             };
             let line = forced_at(host, *pos);
+            feedback(host, &line);
+            Flow::Cancel
+        }
+        "energy" => {
+            let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos") else {
+                feedback(host, "usage: /rftoolsbuilder energy <x> <y> <z>");
+                return Flow::Cancel;
+            };
+            let line = energy_at(host, *pos);
+            feedback(host, &line);
+            Flow::Cancel
+        }
+        "charge" => {
+            let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos") else {
+                feedback(host, "usage: /rftoolsbuilder charge <x> <y> <z> <amount>");
+                return Flow::Cancel;
+            };
+            let Some(CommandArgumentValue::Integer(amount)) = event.command.argument("amount")
+            else {
+                feedback(host, "usage: /rftoolsbuilder charge <x> <y> <z> <amount>");
+                return Flow::Cancel;
+            };
+            let line = charge_block(host, *pos, *amount);
             feedback(host, &line);
             Flow::Cancel
         }
@@ -1996,6 +2168,70 @@ fn forced_at(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
     runtime::forced_line(pos, &chunks)
 }
 
+/// `/rftoolsbuilder energy <pos>`: this Builder's FE buffer and lifetime spend, read from its
+/// saved compound (the same `energy` int the capability reads) — an exact, parseable answer.
+fn energy_at(host: &dyn Host, pos: [i32; 3]) -> String {
+    if !is_builder(host, pos) {
+        return "not a builder".to_owned();
+    }
+    let saved = entity_at(host, pos)
+        .and_then(|entity| entity.data(host))
+        .unwrap_or_default();
+    energy_line(&EnergyStatus {
+        at: pos,
+        stored: energy_of(&saved),
+        spent: State::read(&saved).energy_spent,
+    })
+}
+
+/// `/rftoolsbuilder charge <pos> <amount>`: bring a Builder's buffer **to** `amount` FE the way
+/// a cable would, through the block's `ENERGY` capability and as many inserts as its
+/// `max_insert` needs. A buffer already at or above the target is left alone (the jar's
+/// `GenericEnergyStorage` gives nothing out). Prints the before/after from the saved compound.
+fn charge_block(host: &mut dyn ServerHost, pos: [i32; 3], amount: i32) -> String {
+    if !is_builder(host, pos) {
+        return "not a builder".to_owned();
+    }
+    let Some(level) = host.level(host.dimension()) else {
+        return format!("no level for Builder at {},{},{}", pos[0], pos[1], pos[2]);
+    };
+    let stored = |host: &dyn ServerHost| {
+        host.block_entity(level, pos)
+            .and_then(|entity| entity.data(host))
+            .map_or(0, |saved| energy_of(&saved))
+    };
+    let before = stored(&*host);
+    let wanted = u32::try_from(amount.max(0))
+        .unwrap_or(u32::MAX)
+        .saturating_sub(before);
+    let mut inserted = 0u32;
+    // One insert moves at most `ENERGY_MAX_INSERT`, so fill in bounded passes; a full buffer
+    // (or one with no capability) inserts nothing and ends the loop.
+    for _ in 0..64 {
+        if inserted >= wanted {
+            break;
+        }
+        let missing = wanted - inserted;
+        let took = host
+            .transaction(|host, tx| -> Result<u32, ()> {
+                let Some(buffer) = level.capability(&mut *host, &ENERGY, pos, None) else {
+                    return Ok(0);
+                };
+                Ok(buffer.insert(&mut *host, tx, missing))
+            })
+            .unwrap_or(0);
+        if took == 0 {
+            break;
+        }
+        inserted += took;
+    }
+    let after = stored(&*host);
+    format!(
+        "charged Builder at {} {} {}: {} -> {} FE (inserted {})",
+        pos[0], pos[1], pos[2], before, after, inserted
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2159,6 +2395,7 @@ mod tests {
                 reason: RefusalReason::NoMaterial,
             }),
             forced_chunk: Some([3, -1]),
+            energy_spent: 8_100,
         };
         let mut nbt = Compound::new();
         state.write(&mut nbt);
@@ -2175,6 +2412,45 @@ mod tests {
         assert!(!nbt.contains_key(&key!(K_CURSOR)));
         assert!(!nbt.contains_key(&key!(K_REFUSAL_POS)));
         assert_eq!(nbt.get(&key!(K_REFUSAL)), Some(&Tag::Byte(REFUSAL_NONE)));
+    }
+
+    #[test]
+    fn a_buffer_pays_only_what_it_holds() {
+        let mut nbt = Compound::new();
+        set_energy(&mut nbt, 8_100);
+        assert_eq!(energy_of(&nbt), 8_100);
+        let mut spent = 0;
+        assert!(spend(&mut nbt, &mut spent, cell_cost(CellCharge::Quarry)));
+        assert_eq!(energy_of(&nbt), 7_800);
+        assert_eq!(spent, 300);
+        // An empty buffer cannot pay a cell and leaves both the buffer and the spend untouched.
+        set_energy(&mut nbt, 50);
+        assert!(!spend(&mut nbt, &mut spent, cell_cost(CellCharge::Quarry)));
+        assert_eq!(energy_of(&nbt), 50);
+        assert_eq!(spent, 300);
+        // The jar's max, not an overflowing int, is what a saved compound reports.
+        set_energy(&mut nbt, i32::MAX as u32);
+        assert_eq!(energy_of(&nbt), ENERGY_CAPACITY as u32);
+    }
+
+    #[test]
+    fn twenty_seven_quarry_cells_spend_the_exact_buffer_difference() {
+        let mut nbt = Compound::new();
+        set_energy(&mut nbt, 20_000);
+        let mut spent = 0;
+        for _ in 0..27 {
+            assert!(spend(&mut nbt, &mut spent, cell_cost(CellCharge::Quarry)));
+        }
+        assert_eq!(spent, 8_100);
+        assert_eq!(energy_of(&nbt), 11_900);
+        // A void card over the same 27 cells spends builderRfPerOperation × 0.5, not the
+        // jar's void-list or truncating-supplier readings.
+        set_energy(&mut nbt, 20_000);
+        spent = 0;
+        for _ in 0..27 {
+            assert!(spend(&mut nbt, &mut spent, cell_cost(CellCharge::Void)));
+        }
+        assert_eq!(spent, 6_750);
     }
 
     #[test]

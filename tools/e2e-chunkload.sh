@@ -49,6 +49,18 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 say() { echo "== $* =="; }
 block_name() { ctl block "$1" "$2" "$3" | jq -r '.block // "unknown"' 2>/dev/null || echo unknown; }
 mod() { ctl chat "/rftoolsbuilder $*" >/dev/null; ctl wait 8 >/dev/null; }
+# Fill a Builder's FE buffer through its energy capability (a cable stand-in).
+charge() { # charge X Y Z [amount]
+    local amount=${4:-1000000} i out=""
+    for i in 1 2 3 4 5; do
+        mod charge "$1" "$2" "$3" "$amount"
+        out=$(ctl messages 20 | jq -r '.chat[]' \
+            | grep -E "^charged Builder at $1 $2 $3:|^not a builder" | head -1 || true)
+        [ -n "$out" ] && { echo "$out"; return 0; }
+        ctl wait 5 >/dev/null
+    done
+    echo "$out"
+}
 answer() {
     local i out=""
     for i in 1 2 3 4 5; do
@@ -123,6 +135,7 @@ rig() { # bx by bz label
     ctl command "setblock $bx $by $bz $BUILDER" >/dev/null
     ctl wait 6 >/dev/null
     [ "$(block_name "$bx" "$by" "$bz")" = "$BUILDER" ] || fail "the $label Builder is not at $bx $by $bz"
+    echo "$label charge: $(charge "$bx" "$by" "$bz")" >&2
     ctl setblock "$bx" $((by + 1)) "$bz" minecraft:chest >/dev/null
     RIG_CHEST_BEFORE=$(chest_total "$bx" $((by + 1)) "$bz")
     ctl command "clear @a" >/dev/null
@@ -242,7 +255,9 @@ say "RIG 2: a second Builder forces its OWN ticket in a different unloaded chunk
 ctl tp "$PX.5" 101 "$((PZ + 4)).5" >/dev/null
 ctl wait 20 >/dev/null
 BX2=$((PX + 4)); BY2=$BY; BZ2=$BZ
-OX2=$((OX - 4)); OZ2=$((OZ - 96))
+# Rig 1's corner sits at +z and its render radius loads the chunks around it, so rig 2 must
+# target the OPPOSITE side (-z, the full 260-block clamp) to be deterministically unloaded.
+OX2=$((OX - 4)); OZ2=$((-OZ))
 ctl command "fill $((BX2 - 4)) $((BY2 - 3)) $((BZ2 - 4)) $((BX2 + 4)) $((BY2 + 4)) $((BZ2 + 4)) minecraft:air" >/dev/null
 ctl wait 6 >/dev/null
 ctl setblock "$BX2" $((BY2 - 1)) "$BZ2" minecraft:stone >/dev/null
@@ -250,6 +265,7 @@ ctl setblock "$BX2" $((BY2 - 2)) "$((BZ2 + 3))" minecraft:stone >/dev/null
 ctl command "setblock $BX2 $BY2 $BZ2 $BUILDER" >/dev/null
 ctl wait 6 >/dev/null
 [ "$(block_name "$BX2" "$BY2" "$BZ2")" = "$BUILDER" ] || fail "the second Builder is missing"
+echo "second rig charge: $(charge "$BX2" "$BY2" "$BZ2")" >&2
 ctl setblock "$BX2" $((BY2 + 1)) "$BZ2" minecraft:chest >/dev/null
 ctl command "clear @a" >/dev/null
 ctl tp "$BX2.5" "$((BY2 - 1))" "$((BZ2 + 3)).5" >/dev/null

@@ -7,10 +7,10 @@
 #
 # Cargo's name and version are not the mod's identity: horizon-mod.toml is.
 name = "rftoolsbuilder"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 license = "MIT"
-description = "RFTools Builder for Horizon: the Builder block, its shape cards, the quarry and void card types, and quarry chunk loading"
+description = "RFTools Builder for Horizon: the Builder block, its shape cards, the quarry and void card types, quarry chunk loading, and its FE buffer"
 publish = false
 
 [dependencies]

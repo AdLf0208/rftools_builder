@@ -28,15 +28,16 @@ One flat `.hmod` — `horizon-mod.toml` + `Cargo.toml` + `src/` + `assets/` +
 Status: **ported-partial** — slice 1 (the Builder's shaped mode with its shape
 cards), slice 2 (the carried recipes repaired to the 26.3 dialect and proven in
 game), slice 3 (the quarry card type, its void list and the replacement block),
-slice 4 (`CARD_VOID`) and slice 5 (quarry chunk loading) are implemented, their
-44 runtime tests and 10 glue tests (54 in all) are green, the SDK gate is green,
+slice 4 (`CARD_VOID`), slice 5 (quarry chunk loading) and slice 6 (the FE buffer
+and the per-cell cost) are implemented, their 49 runtime tests and 12 glue tests
+(61 in all) are green, the SDK gate is green,
 and the package is **verified in a launcher-built game**: the modded leg passes
-every phase including the quarry's, the void card's and the force-load leg, the
-unmodded control and the four selftest legs fail. The gap list below is the rest
-of the mod.
+every phase including the quarry's, the void card's, the exact energy-consumption
+readout and the force-load leg, the unmodded control and the six selftest legs
+fail. The gap list below is the rest of the mod.
 
-Package at **0.2.5**: **75,185 B**, SHA-256
-`b647bc0a80cc03265d886e78cbec0617b7a63cb20f2a63f3da29bd5df31dcefc`, built twice byte-identically against SDK **`0a875da9…`** + mixins
+Package at **0.2.6**: **81,105 B**, SHA-256
+`a7161ca6521683986586859a6fe60a45ebfa79bce0f17ffa1a4c3a0761b17a92`, built twice byte-identically against SDK **`0a875da9…`** + mixins
 `e59da90…` (`check` exit 0, `fits` `made for` at the pin and `fits` at `0b14f8a`).
 The command → exact-output → log table for every number below is
 [`VALIDATION.md`](VALIDATION.md); the canonical logs are `sdk-test.log`,
@@ -288,9 +289,10 @@ difference from the artifact.
    jar's. Documented as an extension, not fidelity.
 5. **The Builder's container has one slot** (the card), not two: the filter
    module is not carried.
-6. **No energy.** Upstream's Builder consumes FE per block and scales with the
-   infusion factor; this slice builds without power (the FE capability is a
-   recorded gap).
+6. **Energy is now charged (slice 6), but as a flat base cost.** Upstream's
+   `getEnergyForBlock` also multiplies by block hardness and the infusion factor;
+   this port charges the config base (and applies the jar's `(3 - factor)/3`
+   multiplier at factor 0, i.e. 1). Recorded in the slice-6 section.
 7. **`wait` is always on.** Upstream's `BuilderData.DEFAULT_FLAGS` has
    `wait = true`; the port has no GUI to turn it off, so it always waits at a
    cell it has no block for rather than skipping it.
@@ -960,6 +962,163 @@ Every assertion can fail: `SELFTEST=chunkload` inverts the finish assertion and 
 | game build | `bundle-game.sh` (local: `BUILD_LOCAL=1`, no launcher on the remote) | `Compiling rftoolsbase (1 of 2)` / `Compiling rftoolsbuilder (2 of 2)`, `native-0a875da-cd8a0de6d900` | `../rftoolsbuilder-e2e/bundle-game-build-025.log` |
 | in-game | the five legs above + the five existing legs re-run on 0.2.5 | `PASS` + `EXIT:0`; control and five selftests `EXIT:1` | `../rftoolsbuilder-e2e/*.log` |
 
+## Slice 6 (0.2.6, 2026-11-24) — the FE buffer and the per-cell cost
+
+The gap line this slice answers, verbatim from *Gaps* 10: *"**Energy**: no FE
+buffer, no per-block cost, no infusion factor
+(`GenericEnergyStorage`, `BuilderConfiguration.builderRfPer*`)."* It fits `deep`'s
+machine-shaped half exactly as slices 3–5 did: one block-entity energy
+capability, one pure per-cell cost rule in the existing tick and two commands —
+no new block, item, recipe, renderer or dimension.
+
+### The numbers, read from the artefact (not inferred)
+
+`javap -c -p` over the jar's own `BuilderConfiguration.class` and
+`BuilderTileEntity.class` (jar `rftoolsbuilder-1.21-7.0.8.jar`, 1,054,376 B):
+
+| config | value | bytecode evidence |
+|---|---:|---|
+| `builderMaxRF` (`BUILDER_MAXENERGY`) | **1,000,000** | `ldc #26 // int 1000000` under "Maximum RF storage that the builder can hold" |
+| `builderRFPerTick` (`BUILDER_RECEIVEPERTICK`) | **20,000** | `sipush 20000` under "RF per tick that the builder can receive" |
+| `builderRfPerOperation` | **500** | `sipush 500` under "RF per block operation for the builder when used to build" |
+| `builderRfPerQuarry` | **300** | `sipush 300` under "…when used as a quarry or voider (actual cost depends on hardness)" |
+| `builderRfPerSkipped` | **50** | `bipush 50` (a filtered-out cell; no filter is carried) |
+| `voidShapeCardFactor` | **0.5** | `ldc2_w #183 // double 0.5d` under "RF per operation … multiplied … void shape card" |
+| `silkquarryShapeCardFactor` / `fortunequarryShapeCardFactor` | **3.0 / 2.0** | the next two `defineInRange` doubles (cost factors not carried) |
+| `quarryInfusionSpeedFactor` | **20** | `bipush 20` — a *speed* bonus, not the cost factor |
+| `getEnergyForBlock`'s infusion multiplier | **`(3 - factor) / 3`** | `fconst 3.0`, `fload infusedFactor`, `fsub`, `fdiv`; at infusion 0 the multiplier is 1 |
+
+`BuilderTileEntity` also shows `GenericEnergyStorage.getEnergyStored()` /
+`.consumeEnergy(J)` around the "Not enough power!" suspension, and saves the
+amount under the compound key `energy` (`ldc_w // String energy` in its save
+method). The SDK at this pin declares this through
+`Registrar::block_energy` + `ModEnergyBuffer { capacity, max_insert, max_extract,
+insert_faces, extract_faces }`; the amount stays in the saved `energy` int.
+
+**Three artefact readings disagree for the void card, all recorded:** the
+config comment says "RF per operation × factor" (`500 × 0.5 = 250`);
+`ShapeCardType.lambda$static$2` applies the factor to `builderRfPerQuarry`
+with `(int)` truncation (`300 × 0 = 0`); and `handleSingleBlock` applies it to
+`builderRfPerQuarry` as a double (`300 × 0.5 = 150`). The port adopts the
+config's stated meaning — **250 FE per void cell** — and the in-game assertion
+proves that number. This is an upstream defect fixed, not a copy of one.
+
+### What the port carries, and the deliberate simplifications
+
+- **The capability**: `register` declares `ModEnergyBuffer` on the Builder with
+  the jar's 1,000,000 capacity and 20,000 insert, no extract and all six insert
+  faces. `/rftoolsbuilder charge <pos> <amount>` fills it through the `ENERGY`
+  capability in bounded inserts (the harness stand-in for a cable; there is no
+  GUI in this package).
+- **The rule**: `runtime::cell_cost` is a pure per-cell base cost — build 500,
+  quarry 300, void `500 × 0.5 = 250`, skipped 50 — and
+  `runtime::adjusted_cost` keeps the jar's `(3 - factor) / 3` infusion multiplier
+  with this package's infusion factor 0, so the paid amount equals the base.
+  `support::spend` charges the saved `energy` int only after a cell actually
+  acts and refuses it before a block is broken or material is taken; a full
+  container, air, the Builder's own box and a protected cell still cost nothing.
+- **The readout**: `/rftoolsbuilder energy <pos>` prints stored/capacity,
+  lifetime spend and all four per-cell costs as one parseable line.
+  `RefusalReason::NoPower` says `not enough power` at the stalled cell (the
+  jar's `Not enough power!` suspension) and the Builder waits there with 0
+  acted cells; charging the buffer resumes the pass.
+- **Deviations**: the jar's `getEnergyForBlock` also multiplies by
+  `(int)((hardness + 1) × 2)` and, for a voided block, applies the factor to
+  `builderRfPerQuarry`; the port charges the flat config base so the in-game
+  consumption is exactly `27 × 300 = 8100` (quarry) and `27 × 250 = 6750`
+  (void). No filter module is carried, so `builderRfPerSkipped` never fires.
+  Silk/fortune cost factors and the infuser are out of scope (gaps below).
+
+### Red → green
+
+- **Red (unit, the API did not exist):** five new tests written first —
+  `the_jars_energy_constants_are_read_not_guessed`,
+  `a_void_card_costs_half_of_builder_rf_per_operation`,
+  `twenty_seven_quarry_cells_cost_exactly_eight_thousand_one_hundred_fe`,
+  `an_uninfused_builder_pays_the_full_cell_cost`,
+  `the_energy_readout_prints_the_buffer_and_what_was_spent` — failed to compile:
+
+  ```
+  error[E0425]: cannot find value `ENERGY_CAPACITY` in this scope
+  error[E0433]: cannot find type `CellCharge` in this scope
+  error[E0425]: cannot find function `energy_line` in this scope
+  error: could not compile `rftoolsbuilder` (lib test) due to 31 previous errors
+  TEST_EXIT:101
+  ```
+
+  (`red-energy-compile.log`.) A second red caught a harness defect while adding
+  the in-game leg: the charge reply used commas where every other readout uses
+  spaces, so `FAIL: the energy rig did not charge:` (`e2e-package.log` first
+  energy attempt); the reply format was made space-delimited and the helper now
+  retries until the reply lands.
+- **Green:** `cargo test --offline` → `running 61 tests` · `test result: ok. 61
+  passed; 0 failed` (`sdk-test.log`, regenerated for 0.2.6: 49 runtime + 12 glue).
+
+### In game (0.2.6)
+
+Quoted from `../_shared/evidence/rftoolsbuilder-e2e/e2e-package.log`; each rig
+is a **fresh** Builder so `spent` starts at 0, and the fill is read back through
+the `energy` command, not inferred from a missing error:
+
+```
+== == ENERGY: a charged Builder spends the jar's exact per-cell FE == ==
+energy before: Builder at 9 102 -21: energy 1000000/1000000 FE, spent 0 FE, build 500 FE/cell, quarry 300 FE/cell, void 250 FE/cell, skip 50 FE/cell, infusion 0
+energy after quarry: Builder at 9 102 -21: energy 991900/1000000 FE, spent 8100 FE, build 500 FE/cell, quarry 300 FE/cell, void 250 FE/cell, skip 50 FE/cell, infusion 0
+quarry consumption: 8100 FE (expected 8100 = 27 x 300)
+energy after void: Builder at 5 102 -25: energy 993250/1000000 FE, spent 6750 FE, build 500 FE/cell, quarry 300 FE/cell, void 250 FE/cell, skip 50 FE/cell, infusion 0
+empty buffer: Builder at 1 102 -29: energy 0/1000000 FE, spent 0 FE, build 500 FE/cell, quarry 300 FE/cell, void 250 FE/cell, skip 50 FE/cell, infusion 0
+empty-buffer status: Builder at 1 102 -29: ... 0 quarried, refused at 6 103 -30: not enough power
+```
+
+Every assertion can fail: `SELFTEST=energy` inverts the spend to 8101 and exits 1
+at `FAIL: the quarry spent 8100 FE; expected 8101`; the uncharged control exits 1
+if it quarries anything; the unmodded control and the other four selftests fail
+as before. The 0.2.5 chunk-load leg still passes with two independently forced
+tickets (`[17,16]` and `[17,-17]`, each released at pass end).
+
+| leg | result | log |
+|---|---|---|
+| package | **PASS** + `EXIT:0` | `../rftoolsbuilder-e2e/e2e-package.log` |
+| unmodded control | `FAIL: cannot give rftoolsbuilder:builder: this game does not carry the package` + `EXIT:1` | `e2e-control.log` |
+| `SELFTEST=1` | `FAIL: built 24 cells, expected 25` + `EXIT:1` | `e2e-selftest.log` |
+| `SELFTEST=quarry` | `FAIL: the quarry did not replace the 27 cells with minecraft:cobblestone (27 cells differ)` + `EXIT:1` | `e2e-quarry-selftest.log` |
+| `SELFTEST=void` | `FAIL: the void card moved 0 items; expected 1` + `EXIT:1` | `e2e-void-selftest.log` |
+| `SELFTEST=energy` | `FAIL: the quarry spent 8100 FE; expected 8101` + `EXIT:1` | `e2e-energy-selftest.log` |
+| chunk load | **PASS** + `EXIT:0` | `e2e-chunkload.log` |
+| chunk-load control / `SELFTEST=chunkload` | `FAIL` + `EXIT:1` | `e2e-chunkload-control.log`, `e2e-chunkload-selftest.log` |
+| log gate | `logs=15 ok=15 missing-exit=0 bad-exit=0` | — |
+
+**Coverage — the energy family:**
+
+| family | status | proof |
+|---|---|---|
+| the block-entity FE capability (`ModEnergyBuffer`, capacity 1,000,000, insert 20,000) | **tested** | `check` reports 3 capabilitys / 518 API items; in game `charge` fills `0 -> 1000000 FE (inserted 1000000)` through the capability |
+| the saved `energy` int and lifetime `energySpent` | **tested** | unit `a_buffer_pays_only_what_it_holds` and `the_energy_readout_prints_the_buffer_and_what_was_spent`; in game 1000000 → 991900 (quarry) and → 993250 (void), read back from the BE's own compound |
+| the per-cell cost rule (500 build, 300 quarry, 250 void, 50 skip) | **tested** | unit `a_void_card_costs_half_of_builder_rf_per_operation` and `twenty_seven_quarry_cells_spend_the_exact_buffer_difference`; in game 8100 and 6750 FE spent |
+| the infusion multiplier `(3 - factor)/3` at factor 0 | **tested** | unit `an_uninfused_builder_pays_the_full_cell_cost` (1.0 at 0, 0.0 at 3) |
+| the `not enough power` suspension | **tested** | in game `0 quarried, refused at …: not enough power` with `energy 0/1000000`, and `SELFTEST=energy` on the spend |
+| the readouts `/energy` and `/charge` | **tested** | both called through `ctl chat`, their parsed replies asserted (not the absence of an error) |
+| per-block hardness multiplier, silk/fortune cost factors, the infuser | **not ported** | flat config base costs; no infuser in this package (recorded above) |
+
+### Ladder (0.2.6)
+
+| Step | Command | Result | Log |
+|---|---|---|---|
+| red (unit) | `cargo test --offline`, five energy tests first | `cannot find value ENERGY_CAPACITY`, `cannot find type CellCharge`, `due to 31 previous errors`, `TEST_EXIT:101` | `red-energy-compile.log` |
+| unit tests | `cargo test --offline` | `61 passed; 0 failed` | `sdk-test.log` |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | `CLIPPY_EXIT:0`, 0 warnings | `clippy.log` |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | `FMT_EXIT:0` | `fmt.log` |
+| SDK gate | `cargo horizon-mod check` | 518 API items, `Made for 0a875da.`, `CHECK_EXIT:0` | `check.log` |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | `CMP_IDENTICAL`, 81,105 B | `build.log`, `build2.log` |
+| registry check | `cargo horizon-mod check rftoolsbuilder.hmod` | `rftoolsbuilder 0.2.6 (native-mod, … for 26.3)`, `FILE_CHECK_EXIT:0` | `file-check-fits.log` |
+| fits, the pin | `… --build 0a875da…` | `0a875da  made for`, `FITS_PIN_EXIT:0` | `sdk-fits.log` |
+| fits, a different build | `… --build 0b14f8a…` | `0b14f8a  fits`, `FITS_OTHER_EXIT:0` | `sdk-fits-other.log` |
+| package gate | `python3 ports/tools/verify-sdk-package.py rftoolsbuilder` | **1/1** (31 entries, `package matches the tree`, no packed `Cargo.lock`) | — |
+| game build | `bundle-game.sh` (local, `BUILD_LOCAL=1`: no launcher/resources remotely) | `Compiling rftoolsbase (1 of 2)` / `Compiling rftoolsbuilder (2 of 2)`, `native-0a875da-38c46be051d0` | `../rftoolsbuilder-e2e/bundle-game-build-026.log` |
+| in-game | the nine legs above + the 0.2.5 chunk-load legs re-run on 0.2.6 | `PASS` + `EXIT:0`; control and six selftests `EXIT:1` | `../rftoolsbuilder-e2e/*.log` |
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
+
 ## Gaps
 
 1. ~~**No in-game run.**~~ **Closed 2026-11-21**: `ports/tools/launcher-game.sh` and
@@ -986,8 +1145,14 @@ Every assertion can fail: `SELFTEST=chunkload` inverts the finish assertion and 
 8. **The liquid/pump cards** and fluid handling (`placeLiquidBlock`,
    `pumpBlock`, `consumeLiquid`).
 9. **The filter module** and filtered placement (`FilterModuleItem`).
-10. **Energy**: no FE buffer, no per-block cost, no infusion factor
-    (`GenericEnergyStorage`, `BuilderConfiguration.builderRfPer*`).
+10. ~~**Energy**: no FE buffer, no per-block cost, no infusion factor
+    (`GenericEnergyStorage`, `BuilderConfiguration.builderRfPer*`).~~ **Carried
+    2026-11-24** (slice 6, 0.2.6): the Builder declares a `ModEnergyBuffer` with
+    the jar's capacity/insert limits, stores the FE in the saved `energy` int,
+    charges the config's flat per-cell base cost (500 build, 300 quarry,
+    250 void), and suspends with `not enough power` when it cannot pay. The
+    hardness multiplier, silk/fortune cost factors and the infuser itself stay
+    out of scope; `/rftoolsbuilder energy` reads the exact spend back.
 11. **`block_entity_set_placed_by` / `setPlacedBy`** — the pin has no fake
     player, so a placed block's own placement hook does not run (deviation 3).
 12. ~~**Chunk loading**~~. **Carried 2026-11-24** (slice 5, 0.2.5): the Builder
@@ -1006,8 +1171,8 @@ Every assertion can fail: `SELFTEST=chunkload` inverts the finish assertion and 
 
 ## Verification
 
-Slice 1's run (0.2.0) is the table below; the current **0.2.5** numbers are in
-*Ladder (0.2.5)* in the slice-5 section above, and the file-level record is
+Slice 1's run (0.2.0) is the table below; the current **0.2.6** numbers are in
+*Ladder (0.2.6)* in the slice-6 section above, and the file-level record is
 [`VALIDATION.md`](VALIDATION.md).
 
 Every command ran through `ports/tools/build-slot.sh` (one lease per step); logs
@@ -1051,11 +1216,31 @@ Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-de
 ## Publishing
 
 MIT, rank 0. The current artifact is `ports/rftoolsbuilder/rftoolsbuilder.hmod`
-(**75,185 B**, `b647bc0a80cc03265d886e78cbec0617b7a63cb20f2a63f3da29bd5df31dcefc`), version **0.2.5** — an **update** of the entry
-this campaign owns (`Add rftoolsbuilder 0.2.0`, PR #1276, then 0.2.2 merged; 0.2.3
-and 0.2.4 staged on PR #1827), so the PR title is `Update rftoolsbuilder 0.2.5` and
+(**81,105 B**, `a7161ca6521683986586859a6fe60a45ebfa79bce0f17ffa1a4c3a0761b17a92`), version **0.2.6** — an **update** of the entry
+this campaign owns (`Add rftoolsbuilder 0.2.0`, PR #1276, then 0.2.2 merged; 0.2.3,
+0.2.4 and 0.2.5 staged on PR #1827), so the PR title is `Update rftoolsbuilder 0.2.6` and
 the body names the superseded PR. Publishing still needs the maintainer's approval
 (ARCHITECTURE.md §8).
+
+**Changelog (0.2.6) — supersedes 0.2.5:**
+
+- **Energy.** The Builder declares an FE buffer (`builderMaxRF` 1,000,000, taking
+  up to `builderRFPerTick` 20,000 a call) whose amount lives in its saved
+  compound under `energy`, as upstream's `GenericEnergyStorage` does. Each acted
+  cell costs the jar's base config amount — 500 to build, 300 to quarry,
+  `500 × 0.5 = 250` for a void card — at infusion factor 0; a buffer that cannot
+  pay suspends at that cell with `not enough power` without breaking or taking
+  anything. `/rftoolsbuilder energy <pos>` reads the exact buffer and lifetime
+  spend back, and `/rftoolsbuilder charge <pos> <amount>` fills the buffer through
+  the block's energy capability. The per-block hardness multiplier, silk/fortune
+  cost factors and the infuser remain out of scope.
+- 61 tests (was 54), clippy `-D warnings` clean, `check` 0 (518 API items),
+  `fits` `made for` at the pin and `fits` at `0b14f8a`; in game `PASS` + `EXIT:0`
+  with the exact 8100 FE quarry spend, 6750 FE void spend and uncharged
+  `0 quarried … not enough power` control, the unmodded control `EXIT:1`,
+  `SELFTEST=1` `EXIT:1`, `SELFTEST=quarry` `EXIT:1`, `SELFTEST=void` `EXIT:1`,
+  the new `SELFTEST=energy` `EXIT:1` and the re-run `SELFTEST=chunkload` `EXIT:1`;
+  `check-e2e-logs.py --strict` 15/15.
 
 **Changelog (0.2.5) — supersedes 0.2.4:**
 

@@ -65,11 +65,32 @@ pub const QUARRY_TOOL: &str = "minecraft:netherite_pickaxe";
 /// `getHarvesterTool(…, …, fortune)`: the level a fortune quarry's tool carries
 /// (`int fortune = getCardType().isFortune() ? 3 : 0`).
 pub const FORTUNE_LEVEL: u32 = 3;
-/// `BuilderConfiguration.voidShapeCardFactor` (0.5, range 0..1,000,000): the builder's RF per
-/// operation is multiplied by this for `ShapeCardType.CARD_VOID`, so a `builderRfPerQuarry` of
-/// 300 costs 150 RF per voided cell. Energy is not carried by this port (gap 10); the constant
-/// records the jar's measured value so a later energy slice need not guess it.
+/// `BuilderConfiguration.voidShapeCardFactor` (0.5, range 0..1,000,000). The config's own comment
+/// attaches it to "the RF per operation of the builder", so this port's void card costs
+/// `builderRfPerOperation × 0.5` = 250 FE a cell (`cell_cost`). Two readings of the jar disagree
+/// with that comment and are recorded in `notes.md`: `ShapeCardType`'s `CARD_VOID` supplier casts
+/// the factor with `(int)` (0.5 → 0, so it charges nothing), and `handleSingleBlock` applies it to
+/// `builderRfPerQuarry` (300 × 0.5 = 150). The port adopts the config's stated meaning.
 pub const VOID_RF_FACTOR: f64 = 0.5;
+/// `BuilderConfiguration.builderMaxRF`: the FE the Builder can hold (the jar's
+/// `GenericEnergyStorage(1_000_000, …)` capacity).
+pub const ENERGY_CAPACITY: i32 = 1_000_000;
+/// `BuilderConfiguration.builderRFPerTick`: the most one insert into the buffer moves
+/// (`GenericEnergyStorage(…, 20_000)`, the jar's receive-per-tick limit).
+pub const ENERGY_MAX_INSERT: i32 = 20_000;
+/// `BuilderConfiguration.builderRfPerOperation`: the base cost of a shaped build cell (500).
+pub const RF_PER_OPERATION: u32 = 500;
+/// `BuilderConfiguration.builderRfPerQuarry`: the base cost of a broken cell (300).
+pub const RF_PER_QUARRY: u32 = 300;
+/// `BuilderConfiguration.builderRfPerSkipped`: the cost of a filtered-out cell (50). The port
+/// carries no filter module, so no cell is skipped for a filter and this cost never fires here.
+pub const RF_PER_SKIPPED: u32 = 50;
+/// `BuilderConfiguration.quarryInfusionSpeedFactor` (20): blocks per tick gained per infusion
+/// point. The jar's *cost* uses `getInfusedFactor()` as `(3 - factor) / 3` instead.
+pub const INFUSION_SPEED_FACTOR: i32 = 20;
+/// The Builder's infusion factor. This package has no infuser, so it is the jar's un-infused
+/// value and the cost multiplier is exactly 1.
+pub const INFUSION_FACTOR: f32 = 0.0;
 /// `commonQuarryBlock`'s own guard: a 3×3×3 box around the Builder is never quarried.
 pub const BUILDER_CELLS: i32 = 1;
 /// `BuilderTileEntity.DONT_REMOVE_ME`, a block tag upstream creates and ships no members
@@ -308,6 +329,9 @@ pub enum RefusalReason {
     NoRoom,
     /// The cell's chunk is not loaded, so it cannot be read or written this tick.
     Unloaded,
+    /// The Builder's FE buffer cannot pay for this cell (the jar's `Not enough power!`
+    /// suspension). Nothing is broken or placed while it waits.
+    NoPower,
 }
 
 /// The cell the Builder is waiting at, and why.
@@ -1283,6 +1307,7 @@ impl RefusalReason {
                 "no room for the drops (put a container above or below the builder)"
             }
             RefusalReason::Unloaded => "the chunk is not loaded",
+            RefusalReason::NoPower => "not enough power",
         }
     }
 }
@@ -1475,6 +1500,80 @@ pub fn forced_line(at: [i32; 3], chunks: &[[i32; 2]]) -> String {
             .join(", ");
         format!("Forced chunks at {x} {y} {z}: {list}")
     }
+}
+
+// ---------------------------------------------------------------------------
+// Energy: the Builder's FE buffer and the jar's per-cell cost (slice 6)
+// ---------------------------------------------------------------------------
+
+/// The jar's `ShapeCardType` cost supplier for one cell: a shaped build, a quarry break,
+/// a void-card removal, or a filtered-out skip. The amounts are the config values above.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellCharge {
+    /// `CARD_SHAPE`'s `builderRfPerOperation`.
+    Build,
+    /// `CARD_QUARRY*`'s `builderRfPerQuarry`.
+    Quarry,
+    /// `CARD_VOID`'s `builderRfPerOperation × voidShapeCardFactor`.
+    Void,
+    /// `builderRfPerSkipped` (a filter the port does not carry).
+    Skipped,
+}
+
+/// One cell's base FE cost, from the jar's config suppliers.
+#[must_use]
+pub fn cell_cost(charge: CellCharge) -> u32 {
+    match charge {
+        CellCharge::Build => RF_PER_OPERATION,
+        CellCharge::Quarry => RF_PER_QUARRY,
+        CellCharge::Void => (RF_PER_OPERATION as f64 * VOID_RF_FACTOR) as u32,
+        CellCharge::Skipped => RF_PER_SKIPPED,
+    }
+}
+
+/// `BuilderTileEntity.getEnergyForBlock`'s infusion multiplier, `(3 - factor) / 3`. The jar
+/// reads `DefaultInfusable.getInfusedFactor()`; with no infuser this package always pays the
+/// full base cost. Factor 0 is 1 and a fully infused factor of 3 is free.
+#[must_use]
+pub fn infusion_multiplier(factor: f32) -> f32 {
+    (3.0 - factor) / 3.0
+}
+
+/// A cell's cost at a given infusion factor. The port keeps the jar's formula but substitutes
+/// [`INFUSION_FACTOR`] for its own un-infused builder, so the in-game cost is exact.
+#[must_use]
+pub fn adjusted_cost(cost: u32, factor: f32) -> u32 {
+    (f64::from(cost) * f64::from(infusion_multiplier(factor))) as u32
+}
+
+/// What `/rftoolsbuilder energy <pos>` reports: the saved buffer and what this Builder has spent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EnergyStatus {
+    /// The Builder's position.
+    pub at: [i32; 3],
+    /// FE currently in the buffer (the saved compound's `energy` int).
+    pub stored: u32,
+    /// FE spent by this Builder's passes so far (`energySpent`).
+    pub spent: u64,
+}
+
+/// The parsed energy readout: stored/capacity, lifetime spend, every per-cell cost and the
+/// infusion factor, so a charge-and-quarry assertion reads the numbers, not the absence of an
+/// error. Byte-stable; the format is pinned by `the_energy_readout_prints_the_buffer_and_what_was_spent`.
+#[must_use]
+pub fn energy_line(status: &EnergyStatus) -> String {
+    let [x, y, z] = status.at;
+    format!(
+        "Builder at {x} {y} {z}: energy {}/{} FE, spent {} FE, build {} FE/cell, quarry {} FE/cell, void {} FE/cell, skip {} FE/cell, infusion {}",
+        status.stored,
+        ENERGY_CAPACITY,
+        status.spent,
+        cell_cost(CellCharge::Build),
+        cell_cost(CellCharge::Quarry),
+        cell_cost(CellCharge::Void),
+        cell_cost(CellCharge::Skipped),
+        INFUSION_FACTOR as i32,
+    )
 }
 
 #[cfg(test)]
@@ -2689,6 +2788,63 @@ mod tests {
         assert_eq!(
             forced_line([1, 2, 3], &[[12, 11], [13, 11]]),
             "Forced chunks at 1 2 3: [12,11], [13,11]"
+        );
+    }
+
+    // --- Slice 6: energy (the numbers are read from the jar, never guessed) ---
+
+    #[test]
+    fn the_jars_energy_constants_are_read_not_guessed() {
+        assert_eq!(ENERGY_CAPACITY, 1_000_000);
+        assert_eq!(ENERGY_MAX_INSERT, 20_000);
+        assert_eq!(RF_PER_OPERATION, 500);
+        assert_eq!(RF_PER_QUARRY, 300);
+        assert_eq!(RF_PER_SKIPPED, 50);
+        assert_eq!(INFUSION_SPEED_FACTOR, 20);
+        assert_eq!(VOID_RF_FACTOR, 0.5);
+    }
+
+    #[test]
+    fn a_void_card_costs_half_of_builder_rf_per_operation() {
+        assert_eq!(cell_cost(CellCharge::Build), 500);
+        assert_eq!(cell_cost(CellCharge::Quarry), 300);
+        assert_eq!(cell_cost(CellCharge::Void), 250);
+        // The jar's config comment attaches VOID_RF_FACTOR to "RF per operation"
+        // (500), not to builderRfPerQuarry (300), and its (int) cast of 0.5 would
+        // truncate a nonzero cost to 0 — both artefacts are recorded in notes.md.
+        assert_ne!(cell_cost(CellCharge::Void), 150);
+        assert_ne!(cell_cost(CellCharge::Void), 0);
+        assert_eq!(cell_cost(CellCharge::Skipped), 50);
+    }
+
+    #[test]
+    fn twenty_seven_quarry_cells_cost_exactly_eight_thousand_one_hundred_fe() {
+        assert_eq!(27 * cell_cost(CellCharge::Quarry), 8100);
+        assert_eq!(27 * cell_cost(CellCharge::Void), 6750);
+    }
+
+    #[test]
+    fn an_uninfused_builder_pays_the_full_cell_cost() {
+        assert_eq!(INFUSION_FACTOR, 0.0);
+        assert_eq!(infusion_multiplier(0.0), 1.0);
+        assert_eq!(infusion_multiplier(3.0), 0.0);
+        assert_eq!(
+            adjusted_cost(cell_cost(CellCharge::Quarry), INFUSION_FACTOR),
+            300
+        );
+    }
+
+    #[test]
+    fn the_energy_readout_prints_the_buffer_and_what_was_spent() {
+        let status = EnergyStatus {
+            at: [22, 102, -7],
+            stored: 991_900,
+            spent: 8_100,
+        };
+        assert_eq!(
+            energy_line(&status),
+            "Builder at 22 102 -7: energy 991900/1000000 FE, spent 8100 FE, build 500 FE/cell, \
+             quarry 300 FE/cell, void 250 FE/cell, skip 50 FE/cell, infusion 0"
         );
     }
 }

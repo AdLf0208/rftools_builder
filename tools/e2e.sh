@@ -53,7 +53,8 @@
 # SELFTEST=quarry flips the quarry's replacement assertion (it expects cobblestone
 # where the pass writes dirt), so that run MUST end in `FAIL:` too. SELFTEST=void
 # flips the void card's "chest unchanged" assertion to "one cobblestone collected",
-# so that run MUST end in `FAIL:` too.
+# so that run MUST end in `FAIL:` too. SELFTEST=energy expects 8101 rather than 8100
+# FE spent by a 27-cell quarry, so that run MUST end in `FAIL:` too.
 #
 # The mod is one flat `.hmod` the launcher compiles into the game, so GAME must
 # name a game the launcher built with it. The Builder's recipe needs
@@ -108,6 +109,32 @@ count_item() { ctl inventory | jq -r --arg i "$1" '.counts[$i] // 0' 2>/dev/null
 action_bar() { ctl messages 20 | jq -r '.actionbar // ""' 2>/dev/null || echo ""; }
 # A native command goes through player chat (`perform_command`), not `command`.
 mod() { ctl chat "/rftoolsbuilder $*" >/dev/null; ctl wait 8 >/dev/null; }
+# Fill a Builder's FE buffer through its energy capability (a cable stand-in).
+charge() { # charge X Y Z [amount]
+    local amount=${4:-1000000} i out=""
+    for i in 1 2 3 4 5; do
+        mod charge "$1" "$2" "$3" "$amount"
+        out=$(ctl messages 20 | jq -r '.chat[]' \
+            | grep -E "^charged Builder at $1 $2 $3:|^not a builder" | head -1 || true)
+        [ -n "$out" ] && { echo "$out"; return 0; }
+        ctl wait 5 >/dev/null
+    done
+    echo "$out"
+}
+# The parsed energy readout, asked again until it lands (a chat reply can trail the wait).
+energy() { # energy X Y Z
+    local i out=""
+    for i in 1 2 3 4 5; do
+        mod energy "$1" "$2" "$3"
+        out=$(ctl messages 20 | jq -r '.chat[]' \
+            | grep -E "^Builder at $1 $2 $3: energy " | head -1 || true)
+        [ -n "$out" ] && { echo "$out"; return 0; }
+        ctl wait 5 >/dev/null
+    done
+    echo "$out"
+}
+energy_of() { sed -nE 's/.*energy ([0-9]+)\/[0-9]+ FE.*/\1/p' <<<"$1"; }
+spent_of() { sed -nE 's/.*spent ([0-9]+) FE.*/\1/p' <<<"$1"; }
 # The command's answer, from chat, without the colour prefix.
 # The command's own answer: the newest chat line that reads as one (the buffer also holds the
 # scenario's earlier replies, so the *last* match is the answer to this command).
@@ -305,6 +332,8 @@ echo "placed: $(block_state "$X" "$Y" "$Z1")"
 [ -n "$facing" ] || fail "the Builder has no facing property"
 ctl look-at block "$X" "$Y" "$Z1" "$facing" >/dev/null || fail "cannot aim at the block"
 ctl wait 6
+# The Builder now needs FE for every cell it acts on; fill the buffer before any pass.
+echo "main charge: $(charge "$X" "$Y" "$Z1")" >&2
 
 if [ "$COUNTERFACTUAL" = 1 ]; then
     say "counterfactual: a vanilla furnace is not a builder"
@@ -479,6 +508,7 @@ ctl wait 10
 ctl place "$BX" "$BY" "$BZ" --item "$BUILDER" >/dev/null || fail "cannot place the second Builder"
 [ "$(block_name "$BX" "$BY" "$BZ")" = "$BUILDER" ] || fail "the second Builder is not there"
 ctl setblock "$BX" $((BY + 1)) "$BZ" minecraft:chest >/dev/null
+echo "guarded charge: $(charge "$BX" "$BY" "$BZ")" >&2
 for _ in $(seq 1 4); do ctl container "$BX" $((BY + 1)) "$BZ" minecraft:stone 64 >/dev/null 2>&1 || true; done
 guarded=$(chest_count "$BX" $((BY + 1)) "$BZ" minecraft:stone)
 ctl command "clear @s" >/dev/null
@@ -554,6 +584,11 @@ quarry_rig() {
     ctl command "fill $((QX - 4)) $((QY - 1)) $((QZ - 4)) $((VX2 + 2)) $((QY + 4)) $((VZ2 + 2)) minecraft:air" >/dev/null 2>&1 || true
     ctl wait 6 >/dev/null
     ctl setblock "$QX" $((QY - 1)) "$QZ" minecraft:stone >/dev/null
+    # A standing pad under the click position: rigs placed beyond the arena platform have
+    # terrain 40 blocks below, so a player teleported to y=102 would fall out of interact reach.
+    # (two z cells: a negative `z.5` teleport floors to the block below, not the one named).
+    ctl setblock "$QX" $((QY - 2)) "$((QZ + 2))" minecraft:stone >/dev/null
+    ctl setblock "$QX" $((QY - 2)) "$((QZ + 3))" minecraft:stone >/dev/null
     # The Builder is set in place, as the loot phase does: the item-placement path is the first
     # rig's proof, and this rig's own subject is the card type.
     ctl command "setblock $QX $QY $QZ $BUILDER" >/dev/null 2>&1 || true
@@ -562,6 +597,10 @@ quarry_rig() {
     ctl tp "$QX.5" "$QY" "$((QZ + 3)).5" >/dev/null
     ctl wait 8 >/dev/null
     ctl setblock "$QX" $((QY + 1)) "$QZ" minecraft:chest >/dev/null
+    # RIG_NO_CHARGE=1 builds the uncharged control: a fresh block entity starts at 0 FE.
+    if [ "${RIG_NO_CHARGE:-0}" != 1 ]; then
+        echo "quarry charge: $(charge "$QX" "$QY" "$QZ")" >&2
+    fi
     ctl command "clear @a" >/dev/null
     ctl wait 6 >/dev/null
     echo "quarry Builder: $(block_state "$QX" "$QY" "$QZ")" >&2
@@ -829,6 +868,78 @@ echo "$line" | grep -q "Box (Solid) 3x3x3 offset 6 0 0, 27 cells, 0 placed" \
 [ "$bar" -eq "$control_before" ] || fail "the box card moved the chest to $bar items"
 volume_all minecraft:cobblestone || fail "the box card changed a cell of its volume"
 
+# --- energy (slice 6) ------------------------------------------------------
+# The jar's builderMaxRF/builderRFPerTick/builderRfPer* numbers and the 0.5 void factor are read
+# from BuilderConfiguration's own bytecode (notes.md). Every rig here is a FRESH Builder, so
+# `spent` starts at zero and the charge-and-pass assertion is exact, not a delta of earlier work.
+say "== ENERGY: a charged Builder spends the jar's exact per-cell FE =="
+o_QX=$QX; o_QZ=$QZ; o_VX1=$VX1; o_VX2=$VX2; o_VZ1=$VZ1; o_VZ2=$VZ2
+energy_rig() { # dx dz — a fresh Builder and a 27-stone volume at a distinct site
+    QX=$((o_QX + $1)); QZ=$((o_QZ + $2))
+    VX1=$((QX + 5)); VX2=$((QX + 7)); VZ1=$((QZ - 1)); VZ2=$((QZ + 1))
+    quarry_rig
+    fill_volume 0 0
+}
+
+# A 27-cell quarry pass charges 27 × builderRfPerQuarry = 27 × 300 = 8100 FE.
+# `quarry_rig` fills the fresh buffer to the jar's builderMaxRF; spent is still zero.
+energy_rig -10 -10
+line=$(energy "$QX" "$QY" "$QZ")
+echo "energy before: $line"
+[ "$(energy_of "$line")" = 1000000 ] || fail "the buffer did not hold 1000000 FE: $line"
+[ "$(spent_of "$line")" = 0 ] || fail "a fresh Builder already spent FE: $line"
+install_quarry_card quarry off
+ctl wait 120 >/dev/null
+line=$(status "$QX" "$QY" "$QZ")
+echo "energy quarry status: $line"
+echo "$line" | grep -q "27 quarried, scan complete" \
+    || fail "the charged quarry did not finish 27 cells: $line"
+line=$(energy "$QX" "$QY" "$QZ")
+echo "energy after quarry: $line"
+spent=$(spent_of "$line")
+expected=8100
+# SELFTEST=energy is deliberately tested only here: every earlier phase is byte-identical to the
+# package leg, so the run reaches this exact assertion before it inverts (the other selftests flip
+# earlier phases and exit before the energy rig).
+[ "$SELFTEST" = energy ] && expected=$((expected + 1))
+echo "quarry consumption: $spent FE (expected $expected = 27 x 300)"
+[ "$spent" = "$expected" ] \
+    || fail "the quarry spent $spent FE; expected $expected"
+[ "$(energy_of "$line")" = $((1000000 - 8100)) ] \
+    || fail "the buffer did not fall by 8100 FE: $line"
+
+# A void card over the same 27 cells charges builderRfPerOperation × 0.5 = 250 FE a cell,
+# i.e. 6750 FE — not the 8100 a quarry costs and not the jar's 150/0 readings.
+energy_rig -14 -14
+line=$(energy "$QX" "$QY" "$QZ")
+echo "void energy before: $line"
+[ "$(energy_of "$line")" = 1000000 ] || fail "the void rig did not hold 1000000 FE: $line"
+install_quarry_card void off
+ctl wait 120 >/dev/null
+line=$(status "$QX" "$QY" "$QZ")
+echo "energy void status: $line"
+echo "$line" | grep -q "27 quarried, 27 voided, scan complete" \
+    || fail "the charged void card did not finish 27 cells: $line"
+line=$(energy "$QX" "$QY" "$QZ")
+echo "energy after void: $line"
+[ "$(spent_of "$line")" = 6750 ] \
+    || fail "the void card spent $(spent_of "$line") FE; expected 6750 = 27 x 500 x 0.5"
+
+# CONTROL: the same card geometry on an UNCHARGED Builder stalls at 0 quarried and says why.
+RIG_NO_CHARGE=1 energy_rig -18 -18
+line=$(energy "$QX" "$QY" "$QZ")
+echo "empty buffer: $line"
+[ "$(energy_of "$line")" = 0 ] || fail "a fresh Builder was not empty: $line"
+install_quarry_card quarry off
+ctl wait 120 >/dev/null
+line=$(status "$QX" "$QY" "$QZ")
+echo "empty-buffer status: $line"
+echo "$line" | grep -q "0 quarried" || fail "the uncharged quarry still worked: $line"
+echo "$line" | grep -q "not enough power" || fail "the stall did not name the missing power: $line"
+volume_all minecraft:stone || fail "the uncharged quarry changed a cell of its volume"
+
+QX=$o_QX; QZ=$o_QZ; VX1=$o_VX1; VX2=$o_VX2; VZ1=$o_VZ1; VZ2=$o_VZ2
+
 say "the Builder's loot table drops the Builder"
 # `ctl break` mines the way a player does: survival (creative's instant break is not on that path)
 # and far from the world spawn, whose protection refuses a non-op player's break. So the block is
@@ -890,4 +1001,4 @@ cards=$(count_item "$CARD")
 echo "cards in the inventory after reset: $cards"
 [ "$cards" -eq 1 ] || fail "the reset consumed the card ($cards left)"
 
-echo "PASS: both carried recipes craft in a real crafting table (the shape card from 4 paper, 2 bricks, 1 iron ingot and 2 redstone; the Builder from 4 bricks, an ender pearl, 3 redstone and a machine frame) with their ingredients consumed and their wrong-ingredient controls empty, the game log has no rejected ingredient, the Builder fills its 3x3x3 box from the chest above it (24 placed, 64 -> 40), a hollow 5x5x5 is a 98-cell shell (92 placed against a full chest), a box outside the world border builds 0 and spends nothing, a quarry card over 27 cells breaks them and leaves the configured replacement (25 cobblestone collected, the gravel and the tag-matched coarse dirt voided and not collected), the quarry card keeps its type and void list when it is taken out and put back, tag matching off collects the coarse dirt again, /rftoolsbuilder replace changes the replacement, a void card over 27 stone leaves 27 dirt with 27 quarried and 27 voided and collects nothing while a normal quarry card on the same rig collects all 27, a box card on the same rig collects nothing, the Builder's loot table drops it, the card goes in, comes back out, resets to the 5x5x5 default, and the placed volume survives a relaunch"
+echo "PASS: both carried recipes craft in a real crafting table (the shape card from 4 paper, 2 bricks, 1 iron ingot and 2 redstone; the Builder from 4 bricks, an ender pearl, 3 redstone and a machine frame) with their ingredients consumed and their wrong-ingredient controls empty, the game log has no rejected ingredient, the Builder fills its 3x3x3 box from the chest above it (24 placed, 64 -> 40), a hollow 5x5x5 is a 98-cell shell (92 placed against a full chest), a box outside the world border builds 0 and spends nothing, a quarry card over 27 cells breaks them and leaves the configured replacement (25 cobblestone collected, the gravel and the tag-matched coarse dirt voided and not collected), the quarry card keeps its type and void list when it is taken out and put back, tag matching off collects the coarse dirt again, /rftoolsbuilder replace changes the replacement, a void card over 27 stone leaves 27 dirt with 27 quarried and 27 voided and collects nothing while a normal quarry card on the same rig collects all 27, a box card on the same rig collects nothing, a charged quarry's 27 cells spend exactly 8100 FE while a void card's spend 6750 FE and an empty buffer stalls at 0 quarried with 'not enough power', the Builder's loot table drops it, the card goes in, comes back out, resets to the 5x5x5 default, and the placed volume survives a relaunch"
