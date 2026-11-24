@@ -1,6 +1,6 @@
 id = "rftoolsbuilder"
 name = "RFTools Builder"
-version = "0.2.8"
+version = "0.2.9"
 description = """RFTools Builder for Horizon: the Builder block and its shape cards. A card carries a
 shape (box, sphere, cylinder, capped cylinder, prism, cone, top and bottom dome, torus, heart) or
 one of the quarry card types (normal, silk touch, fortune, and their clearing variants) or the void
@@ -16,8 +16,12 @@ pass ends. The Builder holds an FE buffer and pays the jar's base cost per acted
 deny a block id or tag: a filtered-out cell costs the jar's builderRfPerSkipped 50 FE and is never
 built, and the same filter also applies to quarry cards: a denied block is left in place, its drops are not collected, and it costs the jar's 50 FE skip. /rftoolsbuilder status reads a Builder's card, replacement and progress back, /rftoolsbuilder
 energy reads its buffer and spend, /rftoolsbuilder charge fills it, /rftoolsbuilder filter authors
-the filter, and /rftoolsbuilder forced reads the chunks its ticket holds. The movers, shields, space
-chamber, composer, projector and scanner are not carried."""
+the filter, and /rftoolsbuilder forced reads the chunks its ticket holds. A pump card moves each
+water or lava source in its shape into the Builder's own fluid tank (and the same filter applies to
+quarry cards), one whole 1000 mB bucket per cell, charging the jar's builderRfPerLiquid 300 FE; a
+liquid card places a bucket of fluid from the tank into each replaceable cell, and /rftoolsbuilder
+fluid reads the tank's exact millibuckets back. The movers, shields, space chamber, composer,
+projector and scanner are not carried."""
 authors = ["McJty"]
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins,
 # beside data/ and assets/. The id is the resource namespace and the only identity: Cargo's

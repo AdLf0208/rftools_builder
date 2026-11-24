@@ -1,4 +1,4 @@
-# Validation record — `rftoolsbuilder` 0.2.8
+# Validation record — `rftoolsbuilder` 0.2.9
 
 What was run, on which file, and the exact line it printed. Every log named
 here lives in `ports/_shared/evidence/rftoolsbuilder/` unless it says otherwise.
@@ -14,17 +14,33 @@ on that step only: no launcher or prepared 26.3 resources on the remote);
 
 ```
 ports/rftoolsbuilder/rftoolsbuilder.hmod
-  version 0.2.8     86300 bytes
-  sha256  3b27c182f1ed48ffc1e1bae46342be5bf9b1849f9e9d8318954682fd3e9b81d1
+  version 0.2.9     92715 bytes
+  sha256  626a18010cc73899efdad449bcc666c7af3a4992eb352a3727e463372c8b01db
   [native] game 26.3 · horizon 0a875da91dbb0fdcb7ba8c42c11341aa229af51a · mixins e59da9094f0c2fdda6c627fe9eff22dec6a906f0
   31 entries, no packed Cargo.lock
 ```
 
 `verify-sdk-package.py rftoolsbuilder` → **1/1** (`package matches the tree`,
-`runtime byte-identical 8e649ec75c6a`, R9 clean, `31 entries`, no packed
+`runtime byte-identical a55911481c03`, R9 clean, `31 entries`, no packed
 `Cargo.lock`, skills gate PASS).
 
-## Ladder
+## 0.2.9 (current)
+
+| # | command | exact result | log |
+|---|---|---|---|
+| 1 | `cargo test --offline --lib` | `running 74 tests` · `test result: ok. 74 passed; 0 failed` | `sdk-test.log` |
+| 2 | `cargo clippy --all-targets --offline -- -D warnings` | 0 warnings, exit 0 | `clippy.log` |
+| 3 | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | clean, exit 0 | `fmt.log` |
+| 4 | `cargo horizon-mod check` | `530 items of the API (…3 capabilitys…). Made for 0a875da.` | `check.log` |
+| 5 | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | `CMP_IDENTICAL`, 92,715 B | `build.log`, `build2.log` |
+| 6 | `cargo horizon-mod check rftoolsbuilder.hmod` | `rftoolsbuilder 0.2.9 (native-mod, … for 26.3)`, 92,715 B, `SHA-256 626a1801…01db` | `file-check-fits.log` |
+| 7 | `cargo horizon-mod fits … --build 0a875da91dbb0fdcb7ba8c42c11341aa229af51a` | `0a875da  made for` | `sdk-fits.log` |
+| 8 | `cargo horizon-mod fits … --build 0b14f8acfd97fa2c750e42795249dcc981178ca4` | `0b14f8a  fits` | `sdk-fits-other.log` |
+| 9 | `verify-sdk-package.py rftoolsbuilder` | `1/1 package(s) verified` | — |
+| 10 | package e2e + 8 negatives + 3 chunk-load legs | `PASS` + `EXIT:0`; control and 8 selftests `EXIT:1`; `SELFTEST=pump`: `FAIL: the pump moved 27000 mB; expected 27001` | `../rftoolsbuilder-e2e/*.log` |
+| 11 | `check-e2e-logs.py rftoolsbuilder-e2e --strict` | `logs=19 ok=19 missing-exit=0 bad-exit=0`, exit 0 | — |
+
+## Ladder (historical 0.2.8)
 
 | # | command | exact result | log |
 |---|---|---|---|
@@ -153,6 +169,7 @@ SELFTEST=void GAME=$GAME CTL=$CTL bash tools/e2e.sh         # EXIT:1
 SELFTEST=energy GAME=$GAME CTL=$CTL bash tools/e2e.sh       # EXIT:1
 SELFTEST=filter GAME=$GAME CTL=$CTL bash tools/e2e.sh       # EXIT:1
 SELFTEST=filterquarry GAME=$GAME CTL=$CTL bash tools/e2e.sh # EXIT:1
+SELFTEST=pump GAME=$GAME CTL=$CTL bash tools/e2e.sh         # EXIT:1
 GAME=$GAME CTL=$CTL bash tools/e2e-chunkload.sh              # PASS + EXIT:0
 SELFTEST=chunkload GAME=$GAME CTL=$CTL bash tools/e2e-chunkload.sh  # EXIT:1
 python3 ../../ports/tools/check-e2e-logs.py rftoolsbuilder-e2e --strict

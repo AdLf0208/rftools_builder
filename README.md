@@ -67,6 +67,15 @@ A Horizon native mod (mod API 0.2) that ports **RFTools Builder 1.21-7.0.8**
   `filter none` clears it (the jar's empty filter slot). The container declares
   the jar's second slot, `SLOT_FILTER`; this package's filter rides the card's
   data component rather than a separate filter-module item.
+- **The pump and liquid cards**: `/rftoolsbuilder type pump` (`pump_clear`) makes
+  the Builder move each water or lava **source** in its shape into its own fluid
+  tank, one whole 1000 mB bucket per cell, charging `builderRfPerLiquid` 300 FE;
+  `type liquid` places a bucket of that fluid into each replaceable cell for the
+  same cost. The tank is a 64-bucket block-entity tank whose contents live in the
+  saved `fluids` compound, so the capability and the Builder's tick agree.
+  `/rftoolsbuilder fluid <pos>` reads its exact millibuckets back. The jar uses a
+  tank above or below the Builder; this package has no tank block, so the Builder
+  carries the tank itself (the bucket rule is the jar's).
 - **`/rftoolsbuilder status <pos>`** reads a Builder out: its card type, shape,
   size, offset, cell count, the replacement block, the void list, progress, and
   the first cell it refused and why; `/rftoolsbuilder energy <pos>` also reports
@@ -77,8 +86,7 @@ A Horizon native mod (mod API 0.2) that ports **RFTools Builder 1.21-7.0.8**
 ## What it does not do
 
 The movers and their controls, the shields, the space chamber, the composer, the
-projector, the scanner, the GUI screens and the liquid/pump cards are **not**
-carried. The filter's multi-entry GUI is replaced by the single-entry
+projector, the scanner and the GUI screens are **not** carried. The filter's multi-entry GUI is replaced by the single-entry
 `/rftoolsbuilder filter` command. The per-block hardness multiplier, card-type cost
 factors beyond the void card, and the infuser itself are also out of scope: the
 port charges the jar's base per-cell cost. The `GAPS` list in `notes.md` names

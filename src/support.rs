@@ -17,17 +17,19 @@ use mod_api::{
     BlockEntityTicksEvent, BlockKey, BlockPart, BlockState, BlockUpdateFlags, Capability, Command,
     CommandArgumentValue, Component, Compound, ENERGY, Flow, Hand, Host, HostBlockStates, HostSide,
     HostTransaction, ITEMS, Identifier, InteractionResult, ItemPart, ItemResource, ItemStack,
-    LevelRef, LevelSide, ModContainer, ModEnergyBuffer, PlayerRef, RegisterCommandsEvent,
-    Registrar, RegistrationContext, ResourceHandler, RightClickBlockEvent, RunModCommandEvent,
-    ServerHost, SoundSource, Tag, Text, TicketController, TicketOwner, UseOnEvent,
+    LevelRef, LevelSide, ModContainer, ModEnergyBuffer, ModFluidTanks, PlayerRef,
+    RegisterCommandsEvent, Registrar, RegistrationContext, ResourceHandler, RightClickBlockEvent,
+    RunModCommandEvent, ServerHost, SoundSource, Tag, Text, TicketController, TicketOwner,
+    UseOnEvent,
 };
 
 use crate::runtime::{
     self, BLOCKS_PER_TICK, BUILDER_CELLS, Card, CardKind, CellCharge, CellFacts, DONT_REMOVE_ME,
-    ENERGY_CAPACITY, ENERGY_MAX_INSERT, EnergyStatus, FORTUNE_LEVEL, Filter, FilterMode,
-    INFUSION_FACTOR, LOOKUPS_PER_TICK, Progress, QUARRY_REPLACE, QUARRY_TOOL, Quarry, QuarryStep,
-    Refusal, RefusalReason, Scan, Shape, Status, Voiding, adjusted_cost, cell_cost, energy_line,
-    filter_match, filter_skip_cost,
+    ENERGY_CAPACITY, ENERGY_MAX_INSERT, EnergyStatus, FLUID_TANK_CAPACITY, FORTUNE_LEVEL, Filter,
+    FilterMode, FluidFacts, FluidStatus, FluidStep, FluidWait, INFUSION_FACTOR, LOOKUPS_PER_TICK,
+    Progress, QUARRY_REPLACE, QUARRY_TOOL, Quarry, QuarryStep, Refusal, RefusalReason, Scan, Shape,
+    Status, Voiding, adjusted_cost, cell_cost, energy_line, filter_match, filter_skip_cost,
+    fluid_cost, fluid_line, fluid_step, tank_after,
 };
 
 /// The compound key type, taken from `Tag::String`'s own payload: the API does not re-export the
@@ -92,6 +94,13 @@ const K_FILTER_VALUE: &str = "filterValue";
 /// The filter's mode (`blacklist`): `allow` or `deny`.
 const K_FILTER_MODE: &str = "filterMode";
 
+/// The game's block-entity tank save: `fluids` is a list of `{Fluid, Amount}`
+/// compounds, one per declared tank (`NativeFluidTank` read/writer at this pin).
+const K_FLUIDS: &str = "fluids";
+const K_FLUID_ID: &str = "Fluid";
+const K_FLUID_AMOUNT: &str = "Amount";
+const EMPTY_FLUID: &str = "minecraft:empty";
+
 // --- block-entity keys -----------------------------------------------------
 /// The walking cursor; absent while there is no pass to resume.
 const K_CURSOR: &str = "cursor";
@@ -152,6 +161,7 @@ const REFUSAL_NO_ROOM: i8 = 4;
 const REFUSAL_UNLOADED: i8 = 5;
 /// `RefusalReason::NoPower`.
 const REFUSAL_NO_POWER: i8 = 6;
+const REFUSAL_NO_LIQUID: i8 = 7;
 
 /// The block key the hooks compare the loaded block against. A `BlockKey` only
 /// names itself through a host, so it is asked for once, at registration.
@@ -229,6 +239,15 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
         ..ModEnergyBuffer::default()
     };
     registrar.block_energy(&block, battery);
+    // The jar pumps fluid into (and places it from) a tank above or below the Builder. This
+    // package has no tank block, so the Builder declares one 64-bucket tank as the stand-in;
+    // its contents live in the saved compound under `fluids` and the BE tick reads them there.
+    let mut tank = ModFluidTanks::default();
+    tank.tanks = vec![i32::try_from(FLUID_TANK_CAPACITY).expect("64,000 mB fits an int")];
+    tank.faces = std::array::from_fn(|_| vec![0]);
+    tank.inputs = vec![0];
+    tank.outputs = vec![0];
+    registrar.block_fluids(&block, tank);
     let card = registrar.item_key(CARD_ITEM);
     registrar.item_part(card, ShapeCardItem);
 }
@@ -629,6 +648,7 @@ impl State {
             Some(Tag::Byte(code)) if *code == REFUSAL_NO_ROOM => Some(RefusalReason::NoRoom),
             Some(Tag::Byte(code)) if *code == REFUSAL_UNLOADED => Some(RefusalReason::Unloaded),
             Some(Tag::Byte(code)) if *code == REFUSAL_NO_POWER => Some(RefusalReason::NoPower),
+            Some(Tag::Byte(code)) if *code == REFUSAL_NO_LIQUID => Some(RefusalReason::NoLiquid),
             _ => None,
         }
         .map(|reason| Refusal {
@@ -708,6 +728,7 @@ impl State {
                     RefusalReason::NoRoom => REFUSAL_NO_ROOM,
                     RefusalReason::Unloaded => REFUSAL_UNLOADED,
                     RefusalReason::NoPower => REFUSAL_NO_POWER,
+                    RefusalReason::NoLiquid => REFUSAL_NO_LIQUID,
                 };
                 nbt.insert(key!(K_REFUSAL), Tag::Byte(code));
                 put_ints(nbt, K_REFUSAL_POS, refusal.at);
@@ -745,6 +766,40 @@ fn energy_of(nbt: &Compound) -> u32 {
 /// Write the FE back into the saved compound, the key the capability reads too.
 fn set_energy(nbt: &mut Compound, amount: u32) {
     nbt.insert(key!(K_ENERGY), Tag::Int(amount as i32));
+}
+
+/// What the Builder's fluid tank holds, read from the `fluids` compound the game's
+/// tank backend reads: a list of `{Fluid, Amount}` entries, one per declared tank.
+fn tank_of(nbt: &Compound) -> (Option<String>, u32) {
+    let Some(Tag::List(list)) = nbt.get(&key!(K_FLUIDS)) else {
+        return (None, 0);
+    };
+    let Some(Tag::Compound(entry)) = list.first() else {
+        return (None, 0);
+    };
+    let fluid = match entry.get(&key!(K_FLUID_ID)) {
+        Some(Tag::String(id)) if id.to_string_lossy() != EMPTY_FLUID => Some(id.to_string_lossy()),
+        _ => None,
+    };
+    let amount = match entry.get(&key!(K_FLUID_AMOUNT)) {
+        Some(Tag::Int(value)) => (*value).clamp(0, FLUID_TANK_CAPACITY as i32) as u32,
+        _ => 0,
+    };
+    (fluid, amount)
+}
+
+/// Write the tank back in the game's own shape, so the capability and the BE tick agree.
+fn set_tank(nbt: &mut Compound, fluid: Option<&str>, amount: u32) {
+    let mut entry = Compound::new();
+    entry.insert(
+        key!(K_FLUID_ID),
+        Tag::String(fluid.unwrap_or(EMPTY_FLUID).into()),
+    );
+    entry.insert(
+        key!(K_FLUID_AMOUNT),
+        Tag::Int(amount.min(FLUID_TANK_CAPACITY) as i32),
+    );
+    nbt.insert(key!(K_FLUIDS), Tag::List(vec![Tag::Compound(entry)]));
 }
 
 /// Charge one cell's cost to this Builder's buffer. Nothing is written and `false` is returned
@@ -1056,6 +1111,53 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
                     return;
                 }
             }
+        } else if matches!(card.kind, CardKind::Pump(_) | CardKind::Liquid) {
+            if !level.is_loaded(host, cursor) {
+                state.refusal = Some(Refusal {
+                    at: cursor,
+                    reason: RefusalReason::Unloaded,
+                });
+                break;
+            }
+            match fluid_cell(
+                host,
+                level,
+                pos,
+                cursor,
+                card.kind,
+                &mut event.entity.nbt,
+                &mut state.energy_spent,
+            ) {
+                FluidCell::Skipped => state.progress.skipped += 1,
+                FluidCell::Pumped | FluidCell::Placed => {
+                    acted += 1;
+                    state.progress.placed += 1;
+                    state.refusal = None;
+                }
+                FluidCell::Wait(wait) => {
+                    state.refusal = Some(Refusal {
+                        at: cursor,
+                        reason: match wait {
+                            FluidWait::NoRoom => RefusalReason::NoRoom,
+                            FluidWait::NoLiquid => RefusalReason::NoLiquid,
+                        },
+                    });
+                    state.cursor = Some(cursor);
+                    state.write(&mut event.entity.nbt);
+                    *event.reply = mod_api::BlockEntityTickReply::Changed;
+                    return;
+                }
+                FluidCell::NoPower => {
+                    state.refusal = Some(Refusal {
+                        at: cursor,
+                        reason: RefusalReason::NoPower,
+                    });
+                    state.cursor = Some(cursor);
+                    state.write(&mut event.entity.nbt);
+                    *event.reply = mod_api::BlockEntityTickReply::Changed;
+                    return;
+                }
+            }
         } else {
             if !level.is_loaded(host, cursor) {
                 // Nothing can be read or written there; look again next tick.
@@ -1265,6 +1367,102 @@ fn quarry_cell(
         QuarryCell::Harvested
     } else {
         QuarryCell::Void
+    }
+}
+
+/// What one pump/liquid cell did.
+enum FluidCell {
+    /// The jar's early skip: no source here, the Builder's own box, or unbreakable.
+    Skipped,
+    /// A source was removed and a whole bucket went into the Builder's tank.
+    Pumped,
+    /// A bucket was drained and its fluid block written into the cell.
+    Placed,
+    /// `waitOrSkip`: no whole bucket in the tank, or no room for one more.
+    Wait(FluidWait),
+    /// The buffer cannot pay for this cell: nothing moved.
+    NoPower,
+}
+
+/// One pump/liquid cell: the jar's `pumpBlock` and `placeLiquidBlock`, with the Builder's
+/// own tank standing in for the external tank above or below it. The millibucket rule and
+/// the early guards are the pure [`fluid_step`]; this function only reads the world and
+/// writes the tank, the block and the FE.
+fn fluid_cell(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    builder: [i32; 3],
+    at: [i32; 3],
+    kind: CardKind,
+    nbt: &mut Compound,
+    spent: &mut u64,
+) -> FluidCell {
+    let (held_fluid, held_amount) = tank_of(nbt);
+    // `FluidState.isSource()`: this package's source blocks are the vanilla water and lava
+    // source blocks; a flowing fluid's block id is not one of these.
+    let source: Option<&'static str> = match level.block(host, at).map(|block| block.id(&*host)) {
+        Some(id) if id == "minecraft:water" => Some("minecraft:water"),
+        Some(id) if id == "minecraft:lava" => Some("minecraft:lava"),
+        _ => None,
+    };
+    let destroy_speed = level
+        .block_state(host, at)
+        .and_then(|state| host.block_states().destroy_speed(state))
+        .unwrap_or(0.0);
+    let facts = FluidFacts {
+        near_builder: (0..3).all(|axis| (at[axis] - builder[axis]).abs() <= BUILDER_CELLS),
+        source,
+        destroy_speed,
+        replaceable: is_replaceable(host, level, at),
+        tank_fluid: held_fluid.as_deref(),
+        tank_amount: held_amount,
+    };
+    let step = fluid_step(kind, facts);
+    match step {
+        FluidStep::Skip(_) => return FluidCell::Skipped,
+        FluidStep::Wait(wait) => return FluidCell::Wait(wait),
+        FluidStep::PumpIn | FluidStep::Place => {}
+    }
+    if energy_of(nbt) < fluid_cost() {
+        return FluidCell::NoPower;
+    }
+    let (fluid, amount) = tank_after(step, held_fluid.as_deref(), held_amount);
+    let written = match step {
+        FluidStep::PumpIn => {
+            // The pumped fluid's id is the *source* at this cell, not what the tank
+            // held before (which is empty on the first bucket).
+            let Some(id) = source else {
+                return FluidCell::Skipped;
+            };
+            set_tank(nbt, Some(id), amount);
+            // The jar's `FluidTools.pickupFluidBlock` leaves the source cell as air.
+            host.block_state_id("minecraft:air")
+        }
+        FluidStep::Place => {
+            // The fluid to write is what the tank held *before* the spend: on the
+            // last bucket `tank_after` clears the id because the tank is now empty.
+            let Some(id) = held_fluid.as_deref() else {
+                return FluidCell::Wait(FluidWait::NoLiquid);
+            };
+            set_tank(nbt, fluid, amount);
+            host.block_state_id(id)
+        }
+        FluidStep::Skip(_) | FluidStep::Wait(_) => unreachable!("handled above"),
+    };
+    let Some(state) = written else {
+        return FluidCell::Skipped;
+    };
+    let flags = BlockUpdateFlags::CLIENTS | BlockUpdateFlags::NEIGHBORS;
+    if !level.set_block(host, at, state, flags).unwrap_or(false) {
+        // The write was refused: put the tank and the FE back, as the quarry does.
+        set_tank(nbt, held_fluid.as_deref(), held_amount);
+        return FluidCell::Skipped;
+    }
+    let _ = spend(nbt, spent, fluid_cost());
+    if step == FluidStep::PumpIn {
+        FluidCell::Pumped
+    } else {
+        FluidCell::Placed
     }
 }
 
@@ -1886,6 +2084,11 @@ pub(crate) fn on_register_commands(event: &mut RegisterCommandsEvent<'_>) {
     event
         .commands
         .push(Command::new("rftoolsbuilder forced <pos:block_pos>"));
+    // The Builder's fluid tank: the pump/liquid cards' exact millibuckets, read back in game.
+    event
+        .commands
+        .push(Command::new("rftoolsbuilder fluid <pos:block_pos>"));
+
     // The energy readout and the charger (a harness addition, as `/status` is: with no GUI
     // and no cable in this package, a player otherwise cannot fill the buffer).
     event
@@ -1961,6 +2164,15 @@ pub(crate) fn on_run_mod_command(
                 return Flow::Cancel;
             };
             let line = forced_at(host, *pos);
+            feedback(host, &line);
+            Flow::Cancel
+        }
+        "fluid" => {
+            let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos") else {
+                feedback(host, "usage: /rftoolsbuilder fluid <x> <y> <z>");
+                return Flow::Cancel;
+            };
+            let line = fluid_at(host, *pos);
             feedback(host, &line);
             Flow::Cancel
         }
@@ -2041,7 +2253,7 @@ pub(crate) fn on_run_mod_command(
 /// this port carries one card item, so the type rides the card).
 fn write_type(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> String {
     let Some(CommandArgumentValue::String(name)) = event.command.argument("type") else {
-        return "usage: /rftoolsbuilder type <shape|quarry|quarry_silk|quarry_fortune|quarry_clear|quarry_clear_silk|quarry_clear_fortune|void>".to_owned();
+        return "usage: /rftoolsbuilder type <shape|quarry|quarry_silk|quarry_fortune|quarry_clear|quarry_clear_silk|quarry_clear_fortune|void|pump|pump_clear|liquid>".to_owned();
     };
     let Some(kind) = CardKind::parse(name) else {
         return format!(
@@ -2063,6 +2275,13 @@ fn write_type(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> Stri
                 quarry.description(),
                 if quarry.clearing { ", clearing" } else { "" }
             ),
+            CardKind::Pump(pump) => format!(
+                "Card type set to {} ({}{})",
+                pump.suffix(),
+                pump.description(),
+                if pump.clearing { ", clearing" } else { "" }
+            ),
+            CardKind::Liquid => "Card type set to liquid (Place liquids)".to_owned(),
         }
     })
     .unwrap_or_else(|| "Hold a shape card in your main hand".to_owned())
@@ -2327,6 +2546,23 @@ fn forced_at(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
         .map(|(_, chunk, _)| chunk)
         .collect();
     runtime::forced_line(pos, &chunks)
+}
+
+/// `/rftoolsbuilder fluid <pos>`: the Builder's tank, read from the `fluids` compound the
+/// game's tank capability reads — an exact, parseable millibucket answer.
+fn fluid_at(host: &dyn Host, pos: [i32; 3]) -> String {
+    if !is_builder(host, pos) {
+        return "not a builder".to_owned();
+    }
+    let saved = entity_at(host, pos)
+        .and_then(|entity| entity.data(host))
+        .unwrap_or_default();
+    let (fluid, amount) = tank_of(&saved);
+    fluid_line(&FluidStatus {
+        at: pos,
+        fluid,
+        amount,
+    })
 }
 
 /// `/rftoolsbuilder energy <pos>`: this Builder's FE buffer and lifetime spend, read from its
@@ -2761,7 +2997,7 @@ mod tests {
         assert_eq!(card_of(&bare).kind, CardKind::Shape);
         let mut unknown = Compound::new();
         put_card(&mut unknown, Card::default());
-        unknown.insert(key!(K_TYPE), Tag::String("pump".into()));
+        unknown.insert(key!(K_TYPE), Tag::String("mover".into()));
         assert_eq!(card_of(&unknown).kind, CardKind::Shape);
         let mut broken = Compound::new();
         broken.insert(key!(K_VOIDING), Tag::String("not a list".into()));

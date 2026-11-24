@@ -85,6 +85,20 @@ pub const RF_PER_QUARRY: u32 = 300;
 /// `BuilderConfiguration.builderRfPerSkipped`: the cost of a filtered-out cell (50). The port
 /// carries no filter module, so no cell is skipped for a filter and this cost never fires here.
 pub const RF_PER_SKIPPED: u32 = 50;
+
+/// `BuilderConfiguration.builderRfPerLiquid`: the FE the jar charges per pumped or
+/// placed liquid cell (`sipush 300` under "Base RF per block operation ... as a pump").
+pub const RF_PER_LIQUID: u32 = 300;
+
+/// One bucket in millibuckets. The jar's `checkFluidTank` accepts a fill only when
+/// `fill(stack, SIMULATE) == 1000` and `findAndConsumeLiquid` drains exactly 1000 mB:
+/// one source block in or out is a whole bucket, never a partial one.
+pub const BUCKET_MB: u32 = 1000;
+
+/// The capacity of the Builder's fluid tank. The jar keeps the pumped fluid in an
+/// external tank above or below the Builder and the package has no tank block, so
+/// the Builder declares its own 64-bucket tank (the millibucket rule is the jar's).
+pub const FLUID_TANK_CAPACITY: u32 = 64_000;
 /// `BuilderConfiguration.quarryInfusionSpeedFactor` (20): blocks per tick gained per infusion
 /// point. The jar's *cost* uses `getInfusedFactor()` as `(3 - factor) / 3` instead.
 pub const INFUSION_SPEED_FACTOR: i32 = 20;
@@ -219,6 +233,35 @@ pub struct Quarry {
     pub voids: bool,
 }
 
+/// One of the jar's `CARD_PUMP*` types. `clearing` is `isClearing()` on
+/// `CARD_PUMP_CLEAR`; a pump removes the fluid source either way, so the flag is
+/// carried for the readout and for parity with the quarry's clearing cards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Pump {
+    /// `ShapeCardType.isClearing()` (false for `pump`, true for `pump_clear`).
+    pub clearing: bool,
+}
+
+impl Pump {
+    /// `CARD_PUMP` (`resourceSuffix "pump"`, handler `pumpBlock`).
+    pub const PUMP: Pump = Pump { clearing: false };
+    /// `CARD_PUMP_CLEAR` (`resourceSuffix "pump_clear"`, handler `pumpBlock`).
+    pub const PUMP_CLEAR: Pump = Pump { clearing: true };
+
+    /// The card type's resource suffix, the tail of the jar's item id.
+    #[must_use]
+    pub fn suffix(self) -> &'static str {
+        if self.clearing { "pump_clear" } else { "pump" }
+    }
+
+    /// The jar's `hudLogEntry` for both pump cards (`"    Pump"`), without its
+    /// four leading spaces as for every other card type.
+    #[must_use]
+    pub fn description(self) -> &'static str {
+        "Pump"
+    }
+}
+
 /// The card's type: upstream's `ShapeCardType`, which the jar reads from the **item id**
 /// (`ShapeCardItem.type`). This port carries one card item, so the type rides the card's
 /// own component (a documented deviation, `notes.md`); a card with none is upstream's
@@ -228,8 +271,12 @@ pub enum CardKind {
     /// `CARD_SHAPE`: place a block into every cell of the shape.
     #[default]
     Shape,
-    /// One of the six `CARD_QUARRY*`: break the cells' blocks.
+    /// One of the six `CARD_QUARRY*` plus `CARD_VOID`: break the cells' blocks.
     Quarry(Quarry),
+    /// `CARD_PUMP*` (`pump`, `pump_clear`): move a fluid source into the Builder's tank.
+    Pump(Pump),
+    /// `CARD_PUMP_LIQUID` (`liquid`): place a bucket of fluid from the tank.
+    Liquid,
 }
 
 /// Which blocks a quarry card removes and collects nothing for (`getVoidedBlocks`).
@@ -338,6 +385,8 @@ pub enum RefusalReason {
     /// The Builder's FE buffer cannot pay for this cell (the jar's `Not enough power!`
     /// suspension). Nothing is broken or placed while it waits.
     NoPower,
+    /// A liquid placement found no whole bucket in the tank ("Cannot find liquid!").
+    NoLiquid,
 }
 
 /// The cell the Builder is waiting at, and why.
@@ -536,17 +585,38 @@ impl CardKind {
         match self {
             CardKind::Shape => "shape",
             CardKind::Quarry(quarry) => quarry.suffix(),
+            CardKind::Pump(pump) => pump.suffix(),
+            CardKind::Liquid => "liquid",
         }
     }
 
-    /// The card type a name names: the six quarry suffixes plus `void`, or the plain shape
-    /// card (`shape`, `def`, `shape_card_def`).
+    /// The jar's `hudLogEntry` for this card type, without its four leading spaces.
+    #[must_use]
+    pub fn description(self) -> &'static str {
+        match self {
+            CardKind::Shape => "",
+            CardKind::Quarry(quarry) => quarry.description(),
+            CardKind::Pump(pump) => pump.description(),
+            CardKind::Liquid => "Place liquids",
+        }
+    }
+
+    /// The card type a name names: the quarry suffixes plus `void`, the two pump
+    /// suffixes, `liquid`, or the plain shape card (`shape`, `def`, `shape_card_def`).
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
         if matches!(bare_name(name), "shape" | "def") {
             return Some(CardKind::Shape);
         }
-        Quarry::parse(name).map(CardKind::Quarry)
+        if let Some(quarry) = Quarry::parse(name) {
+            return Some(CardKind::Quarry(quarry));
+        }
+        match bare_name(name) {
+            "pump" => Some(CardKind::Pump(Pump::PUMP)),
+            "pump_clear" => Some(CardKind::Pump(Pump::PUMP_CLEAR)),
+            "liquid" => Some(CardKind::Liquid),
+            _ => None,
+        }
     }
 }
 
@@ -1320,6 +1390,7 @@ impl RefusalReason {
             }
             RefusalReason::Unloaded => "the chunk is not loaded",
             RefusalReason::NoPower => "not enough power",
+            RefusalReason::NoLiquid => "cannot find liquid (put a tank above or below the builder)",
         }
     }
 }
@@ -1388,6 +1459,12 @@ pub fn status_line(status: &Status) -> String {
             quarry.description(),
             if quarry.clearing { ", clearing" } else { "" }
         ),
+        CardKind::Pump(pump) => format!(
+            ", pump ({}{})",
+            pump.description(),
+            if pump.clearing { ", clearing" } else { "" }
+        ),
+        CardKind::Liquid => ", liquid (Place liquids)".to_owned(),
     };
     let replace = match card.kind {
         CardKind::Quarry(quarry) if !quarry.clearing => {
@@ -1409,8 +1486,11 @@ pub fn status_line(status: &Status) -> String {
         card.shape.description(),
         card.solid_word()
     );
-    let quarry = matches!(card.kind, CardKind::Quarry(_));
-    let action = if quarry { "quarried" } else { "placed" };
+    let action = match card.kind {
+        CardKind::Quarry(_) => "quarried",
+        CardKind::Pump(_) => "pumped",
+        CardKind::Shape | CardKind::Liquid => "placed",
+    };
     let voided = if status.progress.voided == 0 {
         String::new()
     } else {
@@ -1597,6 +1677,149 @@ pub fn energy_line(status: &EnergyStatus) -> String {
         cell_cost(CellCharge::Skipped),
         INFUSION_FACTOR as i32,
         status.filter_skipped,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// The pump/liquid cards (slice 9): the Builder's fluid tank and the bucket rule
+// ---------------------------------------------------------------------------
+
+/// What a pump/liquid cell needs to know, mirroring `BuilderTileEntity.pumpBlock`
+/// and `placeLiquidBlock` inputs (`FluidState.isSource`, `getDestroySpeed`,
+/// `isEmptyOrReplacable` and what the tank holds).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FluidFacts<'a> {
+    /// The cell is inside the Builder's own 3×3×3 box.
+    pub near_builder: bool,
+    /// The fluid block id at this cell when it is a **source** (`LiquidBlock` with
+    /// `FluidState.isSource()`); `None` for air, a flowing fluid or a solid block.
+    pub source: Option<&'static str>,
+    /// `BlockState.getDestroySpeed`: below zero means the block cannot be broken.
+    pub destroy_speed: f32,
+    /// `isEmptyOrReplacable`: a liquid cell may be written here.
+    pub replaceable: bool,
+    /// What the Builder's tank holds, borrowed from the BE's saved compound.
+    pub tank_fluid: Option<&'a str>,
+    /// The tank's amount in millibuckets.
+    pub tank_amount: u32,
+}
+
+/// The early returns of `pumpBlock`/`placeLiquidBlock`: the cell is left alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FluidSkip {
+    /// The Builder's own 3×3×3 box.
+    NearBuilder,
+    /// No fluid source here (`FluidState.isEmpty()` or `!isSource()`).
+    NotSource,
+    /// `getDestroySpeed < 0`: bedrock and the like.
+    Unbreakable,
+    /// The cell already holds a block that a liquid cannot replace.
+    NotReplaceable,
+}
+
+/// A wait at a fluid cell: the jar's `waitOrSkip` suspension, with its message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FluidWait {
+    /// `checkFluidTank` refused a whole 1000 mB ("No room for liquid or no usable
+    /// tank above or below!").
+    NoRoom,
+    /// `findAndConsumeLiquid` found no bucket ("Cannot find liquid!").
+    NoLiquid,
+}
+
+/// What the tick does at one pump/liquid cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FluidStep {
+    /// Leave the cell alone.
+    Skip(FluidSkip),
+    /// Remove the fluid source and add one bucket to the tank (`pumpBlock`).
+    PumpIn,
+    /// Drain one bucket from the tank and write its fluid block (`placeLiquidBlock`).
+    Place,
+    /// Wait here; nothing moves.
+    Wait(FluidWait),
+}
+
+/// The jar's per-cell decision, in the order of its two handlers. The rule is
+/// pure: filling/draining the tank and writing the block are the glue's.
+#[must_use]
+pub fn fluid_step(kind: CardKind, facts: FluidFacts<'_>) -> FluidStep {
+    if facts.near_builder {
+        return FluidStep::Skip(FluidSkip::NearBuilder);
+    }
+    match kind {
+        CardKind::Pump(_) => {
+            let Some(fluid) = facts.source else {
+                return FluidStep::Skip(FluidSkip::NotSource);
+            };
+            if facts.destroy_speed < 0.0 {
+                return FluidStep::Skip(FluidSkip::Unbreakable);
+            }
+            // `checkFluidTank`'s SIMULATE fill must take a whole bucket, and a
+            // tank that already holds another fluid refuses this one.
+            if facts.tank_amount + BUCKET_MB > FLUID_TANK_CAPACITY
+                || facts.tank_fluid.is_some_and(|held| held != fluid)
+            {
+                return FluidStep::Wait(FluidWait::NoRoom);
+            }
+            FluidStep::PumpIn
+        }
+        CardKind::Liquid => {
+            if !facts.replaceable {
+                return FluidStep::Skip(FluidSkip::NotReplaceable);
+            }
+            if facts.tank_amount < BUCKET_MB || facts.tank_fluid.is_none() {
+                return FluidStep::Wait(FluidWait::NoLiquid);
+            }
+            FluidStep::Place
+        }
+        CardKind::Shape | CardKind::Quarry(_) => FluidStep::Skip(FluidSkip::NotSource),
+    }
+}
+
+/// The tank after one step: a pump adds a whole bucket, a liquid placement spends
+/// one, and an empty tank becomes `None` (the jar's `FluidStack.EMPTY`).
+#[must_use]
+pub fn tank_after(step: FluidStep, fluid: Option<&str>, amount: u32) -> (Option<&str>, u32) {
+    match step {
+        FluidStep::PumpIn => (fluid, amount + BUCKET_MB),
+        FluidStep::Place => (
+            if amount <= BUCKET_MB { None } else { fluid },
+            amount.saturating_sub(BUCKET_MB),
+        ),
+        FluidStep::Skip(_) | FluidStep::Wait(_) => (fluid, amount),
+    }
+}
+
+/// `builderRfPerLiquid` per pumped/placed cell (the jar's pump cost supplier).
+#[must_use]
+pub fn fluid_cost() -> u32 {
+    RF_PER_LIQUID
+}
+
+/// What `/rftoolsbuilder fluid <pos>` reports from the Builder's tank.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FluidStatus {
+    /// The Builder's position.
+    pub at: [i32; 3],
+    /// The fluid id in the tank, or `None` when empty.
+    pub fluid: Option<String>,
+    /// The amount in millibuckets.
+    pub amount: u32,
+}
+
+/// The parsed fluid readout. Byte-stable; pinned by
+/// `the_fluid_readout_names_the_fluid_and_exact_millibuckets`.
+#[must_use]
+pub fn fluid_line(status: &FluidStatus) -> String {
+    let [x, y, z] = status.at;
+    format!(
+        "Builder at {x} {y} {z}: fluid {} {} mB (capacity {} mB), bucket {} mB, {} FE/cell",
+        status.fluid.as_deref().unwrap_or("none"),
+        status.amount,
+        FLUID_TANK_CAPACITY,
+        BUCKET_MB,
+        RF_PER_LIQUID,
     )
 }
 
@@ -3134,5 +3357,176 @@ mod tests {
     fn a_filtered_out_cell_costs_the_jars_builder_rf_per_skipped() {
         assert_eq!(filter_skip_cost(), 50);
         assert_eq!(filter_skip_cost(), cell_cost(CellCharge::Skipped));
+    }
+
+    // ---- slice 9: the pump/liquid cards and the Builder's fluid tank ----
+
+    #[test]
+    fn the_pump_and_liquid_cards_are_the_jars_eight_and_ninth_card_types() {
+        assert_eq!(BUCKET_MB, 1000); // checkFluidTank SIMULATE == 1000 / findAndConsumeLiquid 1000
+        assert_eq!(RF_PER_LIQUID, 300); // BuilderConfiguration.builderRfPerLiquid
+        assert_eq!(FLUID_TANK_CAPACITY, 64_000);
+        assert_eq!(Pump::PUMP.suffix(), "pump");
+        assert_eq!(Pump::PUMP_CLEAR.suffix(), "pump_clear");
+        assert_eq!(Pump::PUMP.description(), "Pump");
+        assert_eq!(Pump::PUMP_CLEAR.description(), "Pump");
+        assert_eq!(CardKind::Liquid.suffix(), "liquid");
+        assert_eq!(CardKind::Liquid.description(), "Place liquids");
+        assert_eq!(CardKind::parse("pump"), Some(CardKind::Pump(Pump::PUMP)));
+        assert_eq!(
+            CardKind::parse("pump_clear"),
+            Some(CardKind::Pump(Pump::PUMP_CLEAR))
+        );
+        assert_eq!(CardKind::parse("liquid"), Some(CardKind::Liquid));
+        assert_eq!(fluid_cost(), 300);
+    }
+
+    #[test]
+    fn twenty_seven_source_cells_fill_the_tank_with_exactly_one_bucket_each() {
+        let mut amount = 0u32;
+        let mut fluid = None;
+        let mut pumped = 0u32;
+        for _ in 0..27 {
+            let facts = FluidFacts {
+                near_builder: false,
+                source: Some("minecraft:water"),
+                destroy_speed: 1.0,
+                replaceable: false,
+                tank_fluid: fluid,
+                tank_amount: amount,
+            };
+            assert_eq!(
+                fluid_step(CardKind::Pump(Pump::PUMP), facts),
+                FluidStep::PumpIn
+            );
+            // The glue writes the pumped fluid's id into the tank with the amount.
+            (fluid, amount) = tank_after(FluidStep::PumpIn, Some("minecraft:water"), amount);
+            pumped += 1;
+        }
+        assert_eq!(pumped, 27);
+        assert_eq!(fluid, Some("minecraft:water"));
+        assert_eq!(amount, 27_000); // the artefact's exact millibuckets for 27 source cells
+    }
+
+    #[test]
+    fn a_pump_takes_a_whole_bucket_or_nothing_and_waits_when_the_tank_is_full() {
+        let facts = FluidFacts {
+            near_builder: false,
+            source: Some("minecraft:water"),
+            destroy_speed: 1.0,
+            replaceable: false,
+            tank_fluid: Some("minecraft:water"),
+            tank_amount: 64_000 - 500,
+        };
+        assert_eq!(
+            fluid_step(CardKind::Pump(Pump::PUMP), facts),
+            FluidStep::Wait(FluidWait::NoRoom)
+        );
+        assert_eq!(
+            tank_after(
+                FluidStep::Wait(FluidWait::NoRoom),
+                facts.tank_fluid,
+                facts.tank_amount
+            )
+            .1,
+            63_500
+        );
+        // A different fluid cannot go into a tank that already holds one.
+        let other = FluidFacts {
+            tank_fluid: Some("minecraft:lava"),
+            ..facts
+        };
+        assert_eq!(
+            fluid_step(CardKind::Pump(Pump::PUMP), other),
+            FluidStep::Wait(FluidWait::NoRoom)
+        );
+        // The jar's early guards: own box and a non-source (flowing fluid or air).
+        for skip in [
+            FluidFacts {
+                near_builder: true,
+                ..facts
+            },
+            FluidFacts {
+                source: None,
+                ..facts
+            },
+        ] {
+            assert!(matches!(
+                fluid_step(CardKind::Pump(Pump::PUMP), skip),
+                FluidStep::Skip(_)
+            ));
+        }
+        // The jar's destroy-speed guard screens a block that cannot be broken.
+        assert_eq!(
+            fluid_step(
+                CardKind::Pump(Pump::PUMP),
+                FluidFacts {
+                    destroy_speed: -1.0,
+                    ..facts
+                }
+            ),
+            FluidStep::Skip(FluidSkip::Unbreakable)
+        );
+    }
+
+    #[test]
+    fn a_liquid_card_spends_exactly_one_bucket_per_cell_and_waits_when_empty() {
+        let facts = FluidFacts {
+            near_builder: false,
+            source: None,
+            destroy_speed: 1.0,
+            replaceable: true,
+            tank_fluid: Some("minecraft:water"),
+            tank_amount: 27_000,
+        };
+        let mut amount = facts.tank_amount;
+        let mut placed = 0u32;
+        for _ in 0..27 {
+            assert_eq!(fluid_step(CardKind::Liquid, facts), FluidStep::Place);
+            (_, amount) = tank_after(FluidStep::Place, facts.tank_fluid, amount);
+            placed += 1;
+        }
+        assert_eq!(placed, 27);
+        assert_eq!(amount, 0);
+        assert_eq!(
+            fluid_step(
+                CardKind::Liquid,
+                FluidFacts {
+                    tank_amount: 0,
+                    ..facts
+                }
+            ),
+            FluidStep::Wait(FluidWait::NoLiquid)
+        );
+        assert!(matches!(
+            fluid_step(
+                CardKind::Liquid,
+                FluidFacts {
+                    replaceable: false,
+                    ..facts
+                }
+            ),
+            FluidStep::Skip(FluidSkip::NotReplaceable)
+        ));
+    }
+
+    #[test]
+    fn the_fluid_readout_names_the_fluid_and_exact_millibuckets() {
+        assert_eq!(
+            fluid_line(&FluidStatus {
+                at: [42, 102, -18],
+                fluid: Some("minecraft:water".to_owned()),
+                amount: 27_000,
+            }),
+            "Builder at 42 102 -18: fluid minecraft:water 27000 mB (capacity 64000 mB), bucket 1000 mB, 300 FE/cell"
+        );
+        assert_eq!(
+            fluid_line(&FluidStatus {
+                at: [0, 0, 0],
+                fluid: None,
+                amount: 0,
+            }),
+            "Builder at 0 0 0: fluid none 0 mB (capacity 64000 mB), bucket 1000 mB, 300 FE/cell"
+        );
     }
 }

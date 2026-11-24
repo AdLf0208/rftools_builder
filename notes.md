@@ -29,16 +29,17 @@ Status: **ported-partial** — slice 1 (the Builder's shaped mode with its shape
 cards), slice 2 (the carried recipes repaired to the 26.3 dialect and proven in
 game), slice 3 (the quarry card type, its void list and the replacement block),
 slice 4 (`CARD_VOID`), slice 5 (quarry chunk loading), slice 6 (the FE buffer
-and the per-cell cost), slice 7 (the filter module and filtered placement) and
-slice 8 (the quarry's filter path) are implemented, their 57 runtime tests and 12
-glue tests (69 in all) are green, the SDK gate is green,
+and the per-cell cost), slice 7 (the filter module and filtered placement),
+slice 8 (the quarry's filter path) and slice 9 (the pump/liquid cards and the
+Builder's fluid tank) are implemented, their 62 runtime tests and 12
+glue tests (74 in all) are green, the SDK gate is green,
 and the package is **verified in a launcher-built game**: the modded leg passes
 every phase including the quarry's, the void card's, the exact energy-consumption
 readout, both filters' 18 × 50 FE skip spends and the force-load leg, the unmodded
 control and the eight selftest legs fail. The gap list below is the rest of the mod.
 
-Package at **0.2.8**: **86,300 B**, SHA-256
-`3b27c182f1ed48ffc1e1bae46342be5bf9b1849f9e9d8318954682fd3e9b81d1`, built twice byte-identically against SDK **`0a875da9…`** + mixins
+Package at **0.2.9**: **92,715 B**, SHA-256
+`626a18010cc73899efdad449bcc666c7af3a4992eb352a3727e463372c8b01db`, built twice byte-identically against SDK **`0a875da9…`** + mixins
 `e59da90…` (`check` exit 0, `fits` `made for` at the pin and `fits` at `0b14f8a`).
 The command → exact-output → log table for every number below is
 [`VALIDATION.md`](VALIDATION.md); the canonical logs are `sdk-test.log`,
@@ -1399,6 +1400,163 @@ launcher game build ran locally (`BUILD_LOCAL=1`: no launcher/26.3 resources on 
 
 Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
 
+## Slice 9 (0.2.9, 2026-11-24) — the pump/liquid cards and the Builder's fluid tank
+
+The gap line this slice answers, verbatim from *Gaps* 8: *"**The liquid/pump cards**
+and fluid handling (`placeLiquidBlock`, `pumpBlock`, `consumeLiquid`)."* It fits
+`deep`'s machine-shaped half exactly as slices 3–8 did: two more card types and one
+block-entity fluid tank in the Builder's existing tick, with no new block, item,
+recipe, renderer or dimension.
+
+### Surface gate (run first)
+
+`grep -n 'FluidStack|FluidResource|block_fluids|ModFluidTanks|fluid_tank' ports/_shared/sdk/0a875da/`
+found the BE capability at this pin — `Registrar::block_fluids(&BlockKey,
+ModFluidTanks)` (`crates/horizon-mod-vocab/src/item/containers.rs:224`, capacities
+in millibuckets, contents in the entity's saved compound under `fluids`), the
+`FLUIDS` capability as a `ResourceHandler<FluidResource>`
+(`block/fluid_capability.rs:236`), `FluidStack::new(key, amount)` / `.amount` /
+`.with_amount`, `FluidResource::of` / `.to_stack`, and `FluidKey` via
+`r.fluid_key("minecraft:water")`. The capability is deliberately unavailable to
+a machine during its own tick, so the tick reads/writes the `fluids` compound the
+game's tank backend reads: a list of `{Fluid: <id>, Amount: <int>}` entries
+(`native_fluids.rs:136-182` at the pin checkout). The gate passed; no `blocked(…)`.
+
+### The millibucket rules, read from the jar (not inferred)
+
+`javap -c -p` over `BuilderTileEntity.class` and `BuilderConfiguration.class` in
+`rftoolsbuilder-1.21-7.0.8.jar` (1,054,376 B, branch `1.21_neo` @ `409049466`):
+
+- `ShapeCardType` static init: `CARD_PUMP` (`suffix "pump"`, HUD `"    Pump"`),
+  `CARD_PUMP_CLEAR` (`"pump_clear"`, HUD `"    Pump"`, clearing) and
+  `CARD_PUMP_LIQUID` (`suffix "liquid"`, HUD `"    Place liquids"`) — the eighth,
+  ninth and tenth constants (after `CARD_VOID`).
+- `BuilderConfiguration.builderRfPerLiquid` = **300** (`sipush 300` under "Base RF
+  per block operation for the builder when used as a pump").
+- `pumpBlock`: skip a cell whose `FluidState.isEmpty()` or `!isSource()` (and the
+  Builder's own box, `getDestroySpeed < 0`, protected blocks); call
+  `FluidTools.pickupFluidBlock`, then `checkAndInsertFluids`; on success charge the
+  per-cell RF and leave the source cell as air, on failure `waitOrSkip` with
+  `"No room for liquid\nor no usable tank\nabove or below!"`.
+- `checkAndInsertFluids` tries a tank **above** the Builder (facing `DOWN`) then
+  **below** it (facing `UP`); `checkFluidTank` simulates `fill(stack, 1000)` and
+  only executes when the handler takes **exactly 1000 mB** — a whole bucket or
+  nothing.
+- `placeLiquidBlock`: `isEmptyOrReplacable`, then `consumeLiquid`; no whole bucket
+  means `waitOrSkip` with `"Cannot find liquid!\nor no usable tank\nabove or
+  below"`; otherwise write the fluid's `defaultFluidState().createLegacyBlock()`
+  and charge the RF. `findAndConsumeLiquid` scans the tanks and drains **exactly
+  1000 mB** from the first one holding at least that much.
+
+### What the port carries, and the deliberate differences
+
+- **`Pump { clearing }` and `CardKind::Liquid`**: the three suffixes, the two HUD
+  words (`Pump`, `Place liquids`) and `parse` round-trip through the existing
+  component; `/rftoolsbuilder type pump|pump_clear|liquid` authors them, and
+  `/rftoolsbuilder status` names the type and says `pumped` or `placed`.
+- **The rule** (`runtime::fluid_step`) is pure: the early guards in the jar's
+  order, the whole-bucket check (`tank_amount + 1000 <= capacity`, same fluid),
+  the empty-tank wait, and `tank_after` for the saved amount. One whole bucket
+  per cell — 27 source cells move exactly **27,000 mB** — and 300 FE each.
+- **The tank**: the Builder declares one 64,000 mB (64-bucket) `ModFluidTanks`
+  capability and keeps the contents in the `fluids` NBT the game reads. The jar
+  uses an external tank above or below the Builder; this package has no tank
+  block, so the Builder carries the tank itself. The capacity is a package
+  choice; the 1000 mB/cell rule is the artefact's.
+- **Liquids are source blocks**: `minecraft:water` / `minecraft:lava` count as
+  `isSource`, flowing variants do not; a placement writes the source block. The
+  jar's vaporisation, sound and fake-player paths are not carried (no fake
+  player, no Nether test in this scenario).
+- **`pump_clear` leaves air like `pump`** (the picked-up source is already gone);
+  the flag is carried for parity with the quarry's clearing cards.
+- **All-or-nothing**: a tank with room for less than 1000 mB, or holding another
+  fluid, waits with `no room for the drops (put a container above or below the
+  builder)`; an empty tank waits with `cannot find liquid`. Both stay on the
+  cell and break nothing while they wait.
+
+### Red → green
+
+- **Red (unit, the API did not exist):** the five new tests written first —
+  `the_pump_and_liquid_cards_are_the_jars_eight_and_ninth_card_types`,
+  `twenty_seven_source_cells_fill_the_tank_with_exactly_one_bucket_each`,
+  `a_pump_takes_a_whole_bucket_or_nothing_and_waits_when_the_tank_is_full`,
+  `a_liquid_card_spends_exactly_one_bucket_per_cell_and_waits_when_empty` and
+  `the_fluid_readout_names_the_fluid_and_exact_millibuckets` — failed to compile
+  (`evidence/rftoolsbuilder/red-pump-compile.log`):
+
+  ```
+  error[E0425]: cannot find value `BUCKET_MB` in this scope
+  error[E0422]: cannot find struct, variant or union type `FluidFacts` in this scope
+  error[E0433]: cannot find type `Pump` in this scope
+  error[E0599]: no variant or associated item named `Liquid` found for enum `runtime::CardKind`
+  error: could not compile `rftoolsbuilder` (lib test) due to 64 previous errors
+  TEST_EXIT:101
+  ```
+
+- **Green:** `cargo test --offline` → `running 74 tests` · `test result: ok. 74
+  passed; 0 failed` (`sdk-test.log`, regenerated for 0.2.9 after the final build:
+  62 runtime + 12 glue).
+
+### Coverage — the fluid family (ruling 2026-11-20)
+
+| family | status | proof |
+|---|---|---|
+| the three `CARD_PUMP*`/`liquid` constants | **tested** | unit: the suffix/parse/HUD table and `fluid_cost() == 300`; in game: `/rftoolsbuilder type pump|liquid` is accepted and the readout names the type |
+| the 1000 mB bucket rule | **tested** | unit: 27 source cells → exactly 27,000 mB, whole-bucket-or-wait; in game: `/fluid` reads `27000 mB` and `SELFTEST=pump` (expects 27001) `EXIT:1` |
+| `pumpBlock`'s early guards | **tested** | unit: own box, non-source, unbreakable skips; in game: the quarry differential on the same water rig moves no fluid |
+| `placeLiquidBlock` and `consumeLiquid` | **tested** | unit: one bucket spent per placed cell, empty tank waits; in game: the liquid leg spends one bucket per cell from the tank |
+| the BE fluid tank and its `fluids` compound | **tested** | `check` reports the `block_fluids` capability; in game: `/fluid` reads the exact saved millibuckets through `ctl chat` |
+| vaporisation, fake-player sound, flowing-fluid levels | **not ported** | no fake player and no Nether test; a source cell is one bucket (recorded above) |
+
+### In game (0.2.9)
+
+Quoted from `../_shared/evidence/rftoolsbuilder-e2e/e2e-package.log` — a fresh charged Builder
+over a stone-shelled 27-source water volume, read back through `ctl chat`:
+
+```
+== PUMP: a pump card moves 27 water sources into the tank, a whole bucket each ==
+water fill: {"chat":["Successfully filled 27 block(s)"],"ok":true}
+fluid before: Builder at -8 102 -19: fluid none 0 mB (capacity 64000 mB), bucket 1000 mB, 300 FE/cell
+water before: 27
+quarry card: Builder at -8 102 -19: Box (Solid) 3x3x3 offset 6 0 0, 27 cells, pump (Pump), 27 pumped, scan complete
+fluid after pump: Builder at -8 102 -19: fluid minecraft:water 27000 mB (capacity 64000 mB), bucket 1000 mB, 300 FE/cell
+pump tank: 27000 mB (expected 27000 = 27 x 1000)
+water after pump: 0
+== LIQUID: a liquid card places the 27 buckets back, one per replaceable cell ==
+fluid after liquid: Builder at -8 102 -19: fluid none 0 mB (capacity 64000 mB), bucket 1000 mB, 300 FE/cell
+water after liquid: 27
+== CONTROL: a quarry card over the same water rig collects no fluid ==
+quarry-water status: Builder at -12 102 -23: Box (Solid) 3x3x3 offset 6 0 0, 27 cells, quarry (Normal quarry), replacing with minecraft:dirt, 27 quarried, scan complete
+quarry-water fluid: Builder at -12 102 -23: fluid none 0 mB (capacity 64000 mB), bucket 1000 mB, 300 FE/cell
+PASS: ... a pump card over 27 water sources moves exactly 27 x 1000 = 27000 mB into the Builder's tank and leaves the cells as air, a liquid card places the 27 buckets back and drains the tank to 0, and a quarry card on the same water rig collects no fluid
+EXIT:0
+```
+
+The 27 cells are asserted as air after the pump (`volume_all minecraft:air`), the
+tank amount is the artefact's exact 27,000 mB, the liquid leg spends all 27 buckets
+back to 0 mB, and the quarry differential collects none. `SELFTEST=pump` expects
+27,001 mB and exits 1.
+
+### Ladder (0.2.9)
+
+| Step | Command | Result | Log |
+|---|---|---|---|
+| red (unit) | `cargo test --offline`, five fluid tests first | 64 compile errors, `TEST_EXIT:101` | `../_shared/evidence/rftoolsbuilder/red-pump-compile.log` |
+| unit tests | `cargo test --offline` | `74 passed; 0 failed` | `sdk-test.log` |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | `CLIPPY_EXIT:0`, 0 warnings | `clippy.log` |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | clean | `fmt.log` |
+| SDK gate | `cargo horizon-mod check` | 530 API items (3 capabilitys), `Made for 0a875da.`, `CHECK_EXIT:0` | `check.log` |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | `CMP_IDENTICAL` | `build.log`, `build2.log` |
+| registry check | `cargo horizon-mod check rftoolsbuilder.hmod` | `rftoolsbuilder 0.2.9 (native-mod, … for 26.3)`, `FILE_CHECK_EXIT:0` | `file-check-fits.log` |
+| fits, the pin | `… --build 0a875da…` | `0a875da  made for`, `FITS_PIN_EXIT:0` | `sdk-fits.log` |
+| fits, a different build | `… --build 0b14f8a…` | `0b14f8a  fits`, `FITS_OTHER_EXIT:0` | `sdk-fits-other.log` |
+| package gate | `verify-sdk-package.py rftoolsbuilder` | **1/1** (`package matches the tree`, no packed `Cargo.lock`) | — |
+| game build | `bundle-game.sh` (stale `native-*` tags removed first) | `Compiling rftoolsbase (1 of 2)` / `Compiling rftoolsbuilder (2 of 2)`, `native-0a875da-3c372d809e77` | `../rftoolsbuilder-e2e/bundle-game-build-029.log` |
+| in-game | the default leg + eight negative legs + the three chunk-load legs | `PASS` + `EXIT:0`; control and eight selftests `EXIT:1` (`pump`: `FAIL: the pump moved 27000 mB; expected 27001`) | `../rftoolsbuilder-e2e/*.log` |
+| log gate | `check-e2e-logs.py rftoolsbuilder-e2e --strict` | `logs=19 ok=19 missing-exit=0 bad-exit=0` | — |
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
+
 ## Gaps
 
 1. ~~**No in-game run.**~~ **Closed 2026-11-21**: `ports/tools/launcher-game.sh` and
@@ -1422,8 +1580,12 @@ Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-de
 6. **Composer, projector and scanner**, hence `SHAPE_COMPOSITION` and
    `SHAPE_SCAN` shapes (`modules/scanner`).
 7. **The GUI** and the mod's own networking (`client/Gui*`, `network/*`).
-8. **The liquid/pump cards** and fluid handling (`placeLiquidBlock`,
-   `pumpBlock`, `consumeLiquid`).
+8. ~~**The liquid/pump cards** and fluid handling (`placeLiquidBlock`,
+   `pumpBlock`, `consumeLiquid`).~~ **Carried 2026-11-24** (slice 9, 0.2.9): the
+   `pump`/`pump_clear`/`liquid` card types, the Builder's own 64-bucket fluid tank
+   and its exact 1000 mB-per-cell bucket rule, and `/rftoolsbuilder fluid`. The
+   jar's external tank above/below, vaporisation and flowing-fluid levels stay
+   out of scope (the slice-9 section records the differences).
 9. ~~**The filter module** and filtered placement (`FilterModuleItem`).~~
    **Carried 2026-11-24** (slice 7, 0.2.7): allow/deny and id/`#tag` filtering in
    the shaped tick, the `builderRfPerSkipped` 50 FE skip charge, the second
@@ -1457,8 +1619,8 @@ Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-de
 
 ## Verification
 
-Slice 1's run (0.2.0) is the table below; the current **0.2.8** numbers are in
-*Ladder (0.2.8)* in the slice-8 section above, and the file-level record is
+Slice 1's run (0.2.0) is the table below; the current **0.2.9** numbers are in
+*Ladder (0.2.9)* in the slice-9 section above, and the file-level record is
 [`VALIDATION.md`](VALIDATION.md).
 
 Every command ran through `ports/tools/build-slot.sh` (one lease per step); logs
@@ -1502,9 +1664,9 @@ Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-de
 ## Publishing
 
 MIT, rank 0. The current artifact is `ports/rftoolsbuilder/rftoolsbuilder.hmod`
-(**85,091 B**, `6b61c2be83f6f0a35ff2a41883eae322f018fd6fc48e5793cd6c5947f02fefdc`), version **0.2.7** — an **update** of the entry
-this campaign owns (`Add rftoolsbuilder 0.2.0`, PR #1276, then 0.2.2 merged; 0.2.3,
-0.2.4, 0.2.5 and 0.2.6 staged on PR #1827), so the PR title is `Update rftoolsbuilder 0.2.7` and
+(**92,715 B**, `626a18010cc73899efdad449bcc666c7af3a4992eb352a3727e463372c8b01db`), version **0.2.9** — an **update** of the entry
+this campaign owns (`Add rftoolsbuilder 0.2.0`, PR #1276, then 0.2.2 merged; 0.2.3 through
+0.2.8 staged on PR #1827), so the PR title is `Update rftoolsbuilder 0.2.9` and
 the body names the superseded PR. Publishing still needs the maintainer's approval
 (ARCHITECTURE.md §8).
 

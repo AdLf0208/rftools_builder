@@ -66,7 +66,8 @@
 # FE spent by a 27-cell quarry, so that run MUST end in `FAIL:` too. SELFTEST=filter
 # expects 17 skipped cells where the filter skips 18, so that run MUST end in `FAIL:`.
 # SELFTEST=filterquarry expects 17 skipped quarry cells where the pass skips 18, so that
-# run MUST end in `FAIL:` too.
+# run MUST end in `FAIL:` too. SELFTEST=pump expects 27001 mB where the rig holds 27000,
+# so that run MUST end in `FAIL:` too.
 #
 # The mod is one flat `.hmod` the launcher compiles into the game, so GAME must
 # name a game the launcher built with it. The Builder's recipe needs
@@ -145,6 +146,19 @@ energy() { # energy X Y Z
     done
     echo "$out"
 }
+# The parsed fluid readout, asked again until it lands (a chat reply can trail the wait).
+fluid() {
+    local i out=""
+    for i in 1 2 3 4 5; do
+        mod fluid "$1" "$2" "$3"
+        out=$(ctl messages 20 | jq -r '.chat[]' \
+            | grep -E "^Builder at $1 $2 $3: fluid " | head -1 || true)
+        [ -n "$out" ] && { echo "$out"; return 0; }
+        ctl wait 5 >/dev/null
+    done
+    echo "$out"
+}
+fluid_mb_of() { sed -nE 's/.*fluid [^ ]+ ([0-9]+) mB.*/\1/p' <<<"$1"; }
 energy_of() { sed -nE 's/.*energy ([0-9]+)\/[0-9]+ FE.*/\1/p' <<<"$1"; }
 spent_of() { sed -nE 's/.*spent ([0-9]+) FE.*/\1/p' <<<"$1"; }
 filter_spent_of() { sed -nE 's/.*filter skipped ([0-9]+) FE.*/\1/p' <<<"$1"; }
@@ -1202,4 +1216,81 @@ cards=$(count_item "$CARD")
 echo "cards in the inventory after reset: $cards"
 [ "$cards" -eq 1 ] || fail "the reset consumed the card ($cards left)"
 
-echo "PASS: both carried recipes craft in a real crafting table (the shape card from 4 paper, 2 bricks, 1 iron ingot and 2 redstone; the Builder from 4 bricks, an ender pearl, 3 redstone and a machine frame) with their ingredients consumed and their wrong-ingredient controls empty, the game log has no rejected ingredient, the Builder fills its 3x3x3 box from the chest above it (24 placed, 64 -> 40), a hollow 5x5x5 is a 98-cell shell (92 placed against a full chest), a box outside the world border builds 0 and spends nothing, a quarry card over 27 cells breaks them and leaves the configured replacement (25 cobblestone collected, the gravel and the tag-matched coarse dirt voided and not collected), the quarry card keeps its type and void list when it is taken out and put back, tag matching off collects the coarse dirt again, /rftoolsbuilder replace changes the replacement, a void card over 27 stone leaves 27 dirt with 27 quarried and 27 voided and collects nothing while a normal quarry card on the same rig collects all 27, a box card on the same rig collects nothing, a charged quarry's 27 cells spend exactly 8100 FE while a void card's spend 6750 FE and an empty buffer stalls at 0 quarried with 'not enough power', the Builder's loot table drops it, the card goes in, comes back out, resets to the 5x5x5 default, the placed volume survives a relaunch, a deny filter skips its 18 stone cells and spends exactly 18 x 50 = 900 FE on them while an empty filter spends 0, and a deny filter on a QUARRY card skips its 18 stone cells without breaking them or collecting their drops (9 quarried, 18 skipped, 900 FE, the chest holds only the 9 allowed dirt drops) while a filterless quarry on the same rig collects all 27, and both filter readouts are fail-capable"
+# --- the pump/liquid cards and the Builder's fluid tank (slice 9) ------------
+# The jar moves one whole 1000 mB bucket per source cell (checkFluidTank's SIMULATE
+# fill == 1000; findAndConsumeLiquid drains 1000). The Builder's own 64-bucket tank
+# stands in for the external tank above/below the Builder (no tank block here), and
+# /rftoolsbuilder fluid reads the saved fluids compound the capability reads too.
+say "PUMP: a pump card moves 27 water sources into the tank, a whole bucket each"
+o3_QX=$QX; o3_QZ=$QZ
+pump_rig() { # dx dz
+    QX=$((o3_QX + $1)); QZ=$((o3_QZ + $2))
+    VX1=$((QX + 5)); VX2=$((QX + 7)); VZ1=$((QZ - 1)); VZ2=$((QZ + 1))
+    quarry_rig
+}
+water_volume() {
+    # A stone shell holds the sources in place while the pump walks the 27 cells.
+    echo "shell fill: $(ctl command "fill $((VX1 - 1)) $((VY1 - 1)) $((VZ1 - 1)) $((VX2 + 1)) $((VY2 + 1)) $((VZ2 + 1)) minecraft:stone" 2>&1 | head -1)"
+    echo "water fill: $(ctl command "fill $VX1 $VY1 $VZ1 $VX2 $VY2 $VZ2 minecraft:water" 2>&1 | head -1)"
+    ctl wait 10 >/dev/null
+}
+pump_rig -22 -22
+water_volume
+line=$(fluid "$QX" "$QY" "$QZ")
+echo "fluid before: $line"
+[ "$(fluid_mb_of "$line")" = 0 ] || fail "a fresh Builder already held fluid: $line"
+echo "water before: $(volume "$VX1" "$VY1" "$VZ1" "$VX2" "$VY2" "$VZ2" minecraft:water)"
+echo "cell samples before: $(block_name "$VX1" "$VY1" "$VZ1") $(block_name "$((VX1 + 1))" "$VY2" "$VZ2") $(ctl block "$VX1" "$VY1" "$VZ1" 2>&1 | head -1)"
+[ "$(volume "$VX1" "$VY1" "$VZ1" "$VX2" "$VY2" "$VZ2" minecraft:water)" = 27 ] \
+    || fail "the rig did not hold 27 water sources"
+install_quarry_card pump off
+line=$(status "$QX" "$QY" "$QZ")
+echo "pump status: $line"
+echo "$line" | grep -q "pump (Pump)" || fail "the pump card was not in the Builder: $line"
+ctl wait 120 >/dev/null
+line=$(status "$QX" "$QY" "$QZ")
+echo "pump status: $line"
+echo "$line" | grep -q "27 pumped, scan complete" || fail "the pump pass did not finish: $line"
+line=$(fluid "$QX" "$QY" "$QZ")
+echo "fluid after pump: $line"
+mb=$(fluid_mb_of "$line")
+pump_expected=27000
+# SELFTEST=pump inverts the exact-millibucket assertion, so it must end EXIT:1.
+[ "$SELFTEST" = pump ] && pump_expected=27001
+echo "pump tank: $mb mB (expected $pump_expected = 27 x 1000)"
+[ "$mb" = "$pump_expected" ] || fail "the pump moved $mb mB; expected $pump_expected"
+echo "water after pump: $(volume "$VX1" "$VY1" "$VZ1" "$VX2" "$VY2" "$VZ2" minecraft:water)"
+[ "$(volume "$VX1" "$VY1" "$VZ1" "$VX2" "$VY2" "$VZ2" minecraft:water)" = 0 ] \
+    || fail "the pump left a source block in the volume"
+volume_all minecraft:air || fail "the pump did not leave the 27 source cells as air"
+
+say "LIQUID: a liquid card places the 27 buckets back, one per replaceable cell"
+install_quarry_card liquid off
+line=$(status "$QX" "$QY" "$QZ")
+echo "liquid status: $line"
+echo "$line" | grep -q "liquid (Place liquids)" || fail "the liquid card was not installed: $line"
+ctl wait 120 >/dev/null
+line=$(status "$QX" "$QY" "$QZ")
+echo "liquid status: $line"
+echo "$line" | grep -q "27 placed, scan complete" || fail "the liquid pass did not finish: $line"
+line=$(fluid "$QX" "$QY" "$QZ")
+echo "fluid after liquid: $line"
+[ "$(fluid_mb_of "$line")" = 0 ] || fail "the liquid card did not drain the 27 buckets: $line"
+echo "water after liquid: $(volume "$VX1" "$VY1" "$VZ1" "$VX2" "$VY2" "$VZ2" minecraft:water)"
+[ "$(volume "$VX1" "$VY1" "$VZ1" "$VX2" "$VY2" "$VZ2" minecraft:water)" = 27 ] \
+    || fail "the liquid card did not place 27 source cells"
+
+say "CONTROL: a quarry card over the same water rig collects no fluid"
+pump_rig -26 -26
+water_volume
+install_quarry_card quarry off
+ctl wait 120 >/dev/null
+line=$(status "$QX" "$QY" "$QZ")
+echo "quarry-water status: $line"
+line=$(fluid "$QX" "$QY" "$QZ")
+echo "quarry-water fluid: $line"
+[ "$(fluid_mb_of "$line")" = 0 ] || fail "a quarry card collected fluid: $line"
+
+QX=$o3_QX; QZ=$o3_QZ; VX1=$o_VX1; VX2=$o_VX2; VZ1=$o_VZ1; VZ2=$o_VZ2
+
+echo "PASS: both carried recipes craft in a real crafting table (the shape card from 4 paper, 2 bricks, 1 iron ingot and 2 redstone; the Builder from 4 bricks, an ender pearl, 3 redstone and a machine frame) with their ingredients consumed and their wrong-ingredient controls empty, the game log has no rejected ingredient, the Builder fills its 3x3x3 box from the chest above it (24 placed, 64 -> 40), a hollow 5x5x5 is a 98-cell shell (92 placed against a full chest), a box outside the world border builds 0 and spends nothing, a quarry card over 27 cells breaks them and leaves the configured replacement (25 cobblestone collected, the gravel and the tag-matched coarse dirt voided and not collected), the quarry card keeps its type and void list when it is taken out and put back, tag matching off collects the coarse dirt again, /rftoolsbuilder replace changes the replacement, a void card over 27 stone leaves 27 dirt with 27 quarried and 27 voided and collects nothing while a normal quarry card on the same rig collects all 27, a box card on the same rig collects nothing, a charged quarry's 27 cells spend exactly 8100 FE while a void card's spend 6750 FE and an empty buffer stalls at 0 quarried with 'not enough power', the Builder's loot table drops it, the card goes in, comes back out, resets to the 5x5x5 default, the placed volume survives a relaunch, a deny filter skips its 18 stone cells and spends exactly 18 x 50 = 900 FE on them while an empty filter spends 0, and a deny filter on a QUARRY card skips its 18 stone cells without breaking them or collecting their drops (9 quarried, 18 skipped, 900 FE, the chest holds only the 9 allowed dirt drops) while a filterless quarry on the same rig collects all 27, a pump card over 27 water sources moves exactly 27 x 1000 = 27000 mB into the Builder's tank and leaves the cells as air, a liquid card places the 27 buckets back and drains the tank to 0, and a quarry card on the same water rig collects no fluid"

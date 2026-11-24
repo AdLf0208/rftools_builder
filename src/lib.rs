@@ -1,5 +1,5 @@
-//! RFTools Builder for Horizon — the Builder block, its shape cards and the quarry
-//! card type.
+//! RFTools Builder for Horizon — the Builder block, its shape cards, the quarry
+//! card types and the pump/liquid cards.
 //!
 //! A **shape card** (`rftoolsbuilder:shape_card_def`) carries a card type, a shape,
 //! a size, an offset and whether the shape is solid or hollow, in the
