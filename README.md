@@ -42,6 +42,12 @@ A Horizon native mod (mod API 0.2) that ports **RFTools Builder 1.21-7.0.8**
   removes those blocks without collecting them, and `/rftoolsbuilder tagmatching
   on|off` extends each material to its block tag (`getVoidedBlocks`). The card's
   type, void list and toggle are component fields, so they survive being moved.
+- **Chunk loading**: a quarry card registers its own ticket controller and,
+  when it reaches a cell whose chunk is not loaded, force-loads that chunk
+  (releasing the one it held before) so the pass can continue. The ticket is
+  released when the pass ends or the card is removed, so another Builder in the
+  same chunk must force it for itself. `/rftoolsbuilder forced <pos>` reads the
+  chunks a Builder's ticket actually holds from the game's ticket table.
 - **`/rftoolsbuilder status <pos>`** reads a Builder out: its card type, shape,
   size, offset, cell count, the replacement block, the void list, progress, and
   the first cell it refused and why.
@@ -51,9 +57,9 @@ A Horizon native mod (mod API 0.2) that ports **RFTools Builder 1.21-7.0.8**
 ## What it does not do
 
 The movers and their controls, the shields, the space chamber, the composer, the
-projector, the scanner, the GUI screens, the liquid/pump cards, the filter module,
-energy and chunk loading are **not** carried. The `GAPS` list in `notes.md` names
-each with the upstream file that implements it.
+projector, the scanner, the GUI screens, the liquid/pump cards, the filter module
+and energy are **not** carried. The `GAPS` list in `notes.md` names each with the
+upstream file that implements it.
 
 ## Building
 

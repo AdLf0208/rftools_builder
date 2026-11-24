@@ -1402,6 +1402,81 @@ pub fn status_line(status: &Status) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Chunk loading: the force-load branch of `BuilderTileEntity.chunkLoad`
+// ---------------------------------------------------------------------------
+
+/// The chunk `(x >> 4, z >> 4)` holding a block, with the jar's Java arithmetic
+/// shift (negative coordinates round toward negative infinity, as `ChunkPos` does).
+#[must_use]
+pub fn chunk_of(pos: [i32; 3]) -> [i32; 2] {
+    [pos[0] >> 4, pos[2] >> 4]
+}
+
+/// The ticket change a Builder must make on one tick.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TicketPlan {
+    /// The chunk whose ticket is released (the one held on the previous tick).
+    pub release: Option<[i32; 2]>,
+    /// The chunk whose ticket is acquired (the current cell's chunk).
+    pub force: Option<[i32; 2]>,
+}
+
+/// The jar's `chunkLoad` decision when the Builder waits at an unloaded cell:
+/// force that cell's chunk, releasing the chunk it held before. Holding the
+/// same chunk again is a no-op — the jar's `cp.equals(forcedChunk)` early return.
+#[must_use]
+pub fn ticket_step(held: Option<[i32; 2]>, at: [i32; 3]) -> TicketPlan {
+    let chunk = chunk_of(at);
+    if held == Some(chunk) {
+        TicketPlan::default()
+    } else {
+        TicketPlan {
+            release: held,
+            force: Some(chunk),
+        }
+    }
+}
+
+/// The release-only decision when a pass ends, a card is removed, or the block
+/// is broken: the jar's `chunkUnload`.
+#[must_use]
+pub fn ticket_release(held: Option<[i32; 2]>) -> TicketPlan {
+    TicketPlan {
+        release: held,
+        force: None,
+    }
+}
+
+/// The ticket owner the jar uses is a UUID (`getOwnerUUID` in `chunkLoad` and
+/// `chunkUnload`), not a block position. This port has no persistent owner UUID,
+/// so it derives a stable one from the Builder's block: two Builders in one
+/// chunk release separately, and the same Builder keeps its ticket across ticks.
+#[must_use]
+pub fn ticket_owner(pos: [i32; 3]) -> u128 {
+    let coord = |value: i32| (value as u32) as u128;
+    // `RFB` in the high 32 bits, then the three signed coordinates in 32 bits
+    // each. Non-zero, stable, and unique per Builder position.
+    (0x5246_4275u128 << 96) | (coord(pos[0]) << 64) | (coord(pos[1]) << 32) | coord(pos[2])
+}
+
+/// The words `/rftoolsbuilder forced` uses for one Builder's held chunks. It
+/// starts with `Forced` so a status readout can never be mistaken for it.
+#[must_use]
+pub fn forced_line(at: [i32; 3], chunks: &[[i32; 2]]) -> String {
+    let [x, y, z] = at;
+    if chunks.is_empty() {
+        format!("Forced chunks at {x} {y} {z}: none")
+    } else {
+        let list = chunks
+            .iter()
+            .map(|[cx, cz]| format!("[{cx},{cz}]"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("Forced chunks at {x} {y} {z}: {list}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2549,5 +2624,71 @@ mod tests {
         assert_eq!(FORTUNE_LEVEL, 3);
         assert_eq!(DONT_REMOVE_ME, "rftoolsbuilder:dontremoveme");
         assert_eq!(BUILDER_CELLS, 1);
+    }
+
+    // --- chunk loading: the force-load branch of `BuilderTileEntity.chunkLoad` ---
+
+    #[test]
+    fn the_chunk_of_a_cell_is_a_java_arithmetic_shift() {
+        assert_eq!(chunk_of([31, 100, -1]), [1, -1]);
+        assert_eq!(chunk_of([32, 100, 0]), [2, 0]);
+        assert_eq!(chunk_of([-1, 100, -17]), [-1, -2]);
+        assert_eq!(chunk_of([200, 100, 176]), [12, 11]);
+    }
+
+    #[test]
+    fn a_wait_at_an_unloaded_cell_forces_its_chunk_and_releases_the_old_one() {
+        assert_eq!(
+            ticket_step(Some([1, 2]), [40, 100, 33]),
+            TicketPlan {
+                release: Some([1, 2]),
+                force: Some([2, 2]),
+            }
+        );
+        assert_eq!(
+            ticket_step(None, [40, 100, 33]),
+            TicketPlan {
+                release: None,
+                force: Some([2, 2]),
+            }
+        );
+    }
+
+    #[test]
+    fn waiting_again_in_the_same_chunk_does_not_repeat_the_ticket() {
+        assert_eq!(
+            ticket_step(Some([2, 2]), [47, 100, 36]),
+            TicketPlan::default()
+        );
+    }
+
+    #[test]
+    fn finishing_the_pass_releases_the_held_chunk() {
+        assert_eq!(
+            ticket_release(Some([2, 2])),
+            TicketPlan {
+                release: Some([2, 2]),
+                force: None,
+            }
+        );
+        assert_eq!(ticket_release(None), TicketPlan::default());
+    }
+
+    #[test]
+    fn a_builders_ticket_owner_is_stable_and_position_specific() {
+        assert_eq!(ticket_owner([20, 102, 1]), ticket_owner([20, 102, 1]));
+        assert_ne!(ticket_owner([20, 102, 1]), ticket_owner([21, 102, 1]));
+        assert_ne!(ticket_owner([20, 102, 1]), ticket_owner([20, 102, 2]));
+        assert_ne!(ticket_owner([-1, 102, 1]), ticket_owner([1, 102, 1]));
+        assert_ne!(ticket_owner([20, 102, 1]), 0);
+    }
+
+    #[test]
+    fn a_forced_readout_names_only_the_chunks_a_builder_holds() {
+        assert_eq!(forced_line([1, 2, 3], &[]), "Forced chunks at 1 2 3: none");
+        assert_eq!(
+            forced_line([1, 2, 3], &[[12, 11], [13, 11]]),
+            "Forced chunks at 1 2 3: [12,11], [13,11]"
+        );
     }
 }

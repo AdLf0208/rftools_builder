@@ -1,11 +1,11 @@
-# Package receipt — rftoolsbuilder 0.2.4
+# Package receipt — rftoolsbuilder 0.2.5
 
 | field | value |
 |---|---|
-| version | `0.2.4` |
+| version | `0.2.5` |
 | file | `rftoolsbuilder.hmod` |
-| bytes | 71,421 |
-| sha256 | `de192fadf0fd60fef23fadeb5a8db84ef4e08ae989937702838003c92447c5f6` |
+| bytes | 75,185 |
+| sha256 | `b647bc0a80cc03265d886e78cbec0617b7a63cb20f2a63f3da29bd5df31dcefc` |
 | source | this tag — the tree here is the source that produced the archive |
 | game | 26.3 |
 | horizon | `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` |

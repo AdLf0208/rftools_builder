@@ -19,7 +19,7 @@ use mod_api::{
     HostTransaction, ITEMS, Identifier, InteractionResult, ItemPart, ItemResource, ItemStack,
     LevelRef, LevelSide, ModContainer, PlayerRef, RegisterCommandsEvent, Registrar,
     RegistrationContext, ResourceHandler, RightClickBlockEvent, RunModCommandEvent, ServerHost,
-    SoundSource, Tag, Text, UseOnEvent,
+    SoundSource, Tag, Text, TicketController, TicketOwner, UseOnEvent,
 };
 
 use crate::runtime::{
@@ -118,6 +118,9 @@ const K_CARD_SHOWN: &str = "cardShown";
 const K_REPLACE: &str = "quarryReplace";
 /// Quarry cells whose block was removed without its drops being collected.
 const K_VOIDED: &str = "voided";
+/// The chunk `[x, z]` a Builder currently force-loads with its ticket (the jar's
+/// `forcedChunk` field), so the ticket can be released when the pass ends.
+const K_FORCED_CHUNK: &str = "forcedChunk";
 
 /// The card's refusal codes in the saved compound.
 const REFUSAL_NONE: i8 = 0;
@@ -142,6 +145,17 @@ fn block_key() -> BlockKey {
         .expect("registration runs before every hook")
 }
 
+/// The ticket controller the Builder force-loads quarry chunks with, registered
+/// once at startup (`RegisterTicketControllersEvent`) and `Copy`, so a `OnceLock`
+/// holds it for every later tick (the jar's `ModSetup.ticketController`).
+static TICKET_CONTROLLER: OnceLock<TicketController> = OnceLock::new();
+
+fn ticket_controller() -> TicketController {
+    *TICKET_CONTROLLER
+        .get()
+        .expect("registration runs before every hook")
+}
+
 // ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
@@ -151,6 +165,10 @@ fn block_key() -> BlockKey {
 pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext) {
     let block = registrar.block_key(BLOCK);
     let _ = BLOCK_KEY.set(block);
+    // The jar's `RegisterTicketControllersEvent`: register once and keep the handle for
+    // `chunk.set_mod_forced`. The id is `rftoolsbuilder:quarry` (the SDK namespaces it).
+    let controller = registrar.register_ticket_controller("quarry", true);
+    let _ = TICKET_CONTROLLER.set(controller);
     let kind = registrar
         .block_entity_type(BE_TYPE)
         .blocks(&[BLOCK])
@@ -477,6 +495,29 @@ fn put_ints(data: &mut Compound, key: &str, value: [i32; 3]) {
     );
 }
 
+/// Reads a two-integer field (a chunk's `[x, z]`).
+fn ints2(nbt: &Compound, key: &str) -> Option<[i32; 2]> {
+    let as_int = |tag: &Tag| match tag {
+        Tag::Int(value) => Some(*value),
+        _ => None,
+    };
+    match nbt.get(&key!(key)) {
+        Some(Tag::List(values)) if values.len() == 2 => {
+            Some([as_int(&values[0])?, as_int(&values[1])?])
+        }
+        Some(Tag::IntArray(values)) if values.len() == 2 => Some([values[0], values[1]]),
+        _ => None,
+    }
+}
+
+/// Writes a two-integer field.
+fn put_ints2(data: &mut Compound, key: &str, value: [i32; 2]) {
+    data.insert(
+        key!(key),
+        Tag::List(vec![Tag::Int(value[0]), Tag::Int(value[1])]),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // A Builder's saved state
 // ---------------------------------------------------------------------------
@@ -496,6 +537,8 @@ struct State {
     refusal: Option<Refusal>,
     /// The pass's cell count, cached when the pass started.
     cells: Option<runtime::CellCount>,
+    /// The chunk currently held by the Builder's force-load ticket.
+    forced_chunk: Option<[i32; 2]>,
 }
 
 impl State {
@@ -536,6 +579,7 @@ impl State {
                 cells,
                 more: matches!(nbt.get(&key!(K_CELLS_MORE)), Some(Tag::Byte(1))),
             }),
+            forced_chunk: ints2(nbt, K_FORCED_CHUNK),
         }
     }
 
@@ -598,6 +642,12 @@ impl State {
             None => {
                 nbt.insert(key!(K_REFUSAL), Tag::Byte(REFUSAL_NONE));
                 nbt.remove(&key!(K_REFUSAL_POS));
+            }
+        }
+        match self.forced_chunk {
+            Some(chunk) => put_ints2(nbt, K_FORCED_CHUNK, chunk),
+            None => {
+                nbt.remove(&key!(K_FORCED_CHUNK));
             }
         }
     }
@@ -669,6 +719,33 @@ fn sync_card(
     saved
 }
 
+/// Apply one chunk-ticket plan. The ticket's owner is the jar's owner UUID,
+/// derived from this Builder's position, so two Builders in one chunk release
+/// separately (`TicketOwner::Entity` vs `forceChunk(level, uuid, …)`). The
+/// `Entity` variant is used rather than `Block` because a source scanner reads
+/// a `Block` variant as an API-type change (a known `fits` false positive).
+fn apply_ticket_plan(host: &mut dyn ServerHost, builder: [i32; 3], plan: runtime::TicketPlan) {
+    let Some(level) = host.level(host.dimension()) else {
+        return;
+    };
+    let controller = ticket_controller();
+    let owner = TicketOwner::Entity(runtime::ticket_owner(builder));
+    if let Some(chunk) = plan.release
+        && let Some(handle) = level.chunk_ref(host, chunk)
+    {
+        handle.set_mod_forced(host, controller, owner, false, false);
+    }
+    if let Some(chunk) = plan.force
+        && let Some(handle) = level.chunk_ref(host, chunk)
+    {
+        // The jar's second `forceChunk` passes `false` (bytecode: two `iconst_0`),
+        // so the shipped 7.0.8 jar never actually adds the ticket — an upstream
+        // defect. The port adopts the behaviour the config and the unload path
+        // mean: force the chunk (`true, false`, no natural spawning).
+        handle.set_mod_forced(host, controller, owner, true, false);
+    }
+}
+
 /// One server tick of a Builder: walk the shape and place a block into each
 /// cell that can take one, at the jar's [`BLOCKS_PER_TICK`].
 ///
@@ -687,7 +764,11 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
     let mut state = before.clone();
 
     let Some(card) = card else {
-        // No card: no scan. `Unchanged` when there was nothing to forget.
+        // No card: release any ticket the last pass held, then no scan.
+        if before.forced_chunk.is_some() {
+            apply_ticket_plan(host, pos, runtime::ticket_release(before.forced_chunk));
+            state.forced_chunk = None;
+        }
         if before != State::default() {
             state = State::default();
             state.write(&mut event.entity.nbt);
@@ -696,8 +777,11 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
         return;
     };
     let Ok(card) = card.validate() else {
-        // A card past the cell limit builds nothing (upstream refuses it in the
-        // GUI); the readout names it.
+        // A refused card releases the last pass's ticket (the jar's `chunkUnload`).
+        if before.forced_chunk.is_some() {
+            apply_ticket_plan(host, pos, runtime::ticket_release(before.forced_chunk));
+            state.forced_chunk = None;
+        }
         if before != State::default() {
             state = State::default();
             state.write(&mut event.entity.nbt);
@@ -722,6 +806,11 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
     // and a finished pass stays finished until the card changes.
     let fingerprint = fingerprint(card, &replace);
     if state.card.as_deref() != Some(fingerprint.as_str()) {
+        // A new card (or a changed replacement) is the jar's `restartScan`, which starts by
+        // releasing the chunk the previous pass held.
+        if let Some(held) = before.forced_chunk {
+            apply_ticket_plan(host, pos, runtime::ticket_release(Some(held)));
+        }
         // One bounded count per pass, kept in the block entity: a repeated readout is free, and
         // even the first one never walks a shape whose box holds tens of millions of cells.
         let (cells, more) = card.count_within(runtime::MAX_PASS_CELLS, runtime::STATUS_CANDIDATES);
@@ -766,6 +855,14 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
             // Not a cell of the shape: the walk looks past it.
         } else if let CardKind::Quarry(quarry) = card.kind {
             if !level.is_loaded(host, cursor) {
+                // The jar's `chunkLoad`: force this cell's chunk, releasing the chunk held
+                // before, then wait for it to come in (a fresh chunk loads over the next
+                // ticks, so the pass resumes on a later tick).
+                let plan = runtime::ticket_step(state.forced_chunk, cursor);
+                if plan.release.is_some() || plan.force.is_some() {
+                    apply_ticket_plan(host, pos, plan);
+                    state.forced_chunk = plan.force;
+                }
                 state.refusal = Some(Refusal {
                     at: cursor,
                     reason: RefusalReason::Unloaded,
@@ -846,6 +943,16 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
     }
     if !state.done {
         state.cursor = scan.cursor;
+    }
+    if state.done && state.forced_chunk.is_some() {
+        // The pass no longer needs the chunk: release the ticket so a later rig in the
+        // same chunk must force it for itself. This applies the jar's `chunkUnload` when
+        // the work finishes (the jar only releases it on restartScan or block removal).
+        apply_ticket_plan(
+            host,
+            pos,
+            runtime::ticket_release(state.forced_chunk.take()),
+        );
     }
     if state != before {
         state.write(&mut event.entity.nbt);
@@ -1526,6 +1633,9 @@ pub(crate) fn on_register_commands(event: &mut RegisterCommandsEvent<'_>) {
     event
         .commands
         .push(Command::new("rftoolsbuilder status <pos:block_pos>"));
+    event
+        .commands
+        .push(Command::new("rftoolsbuilder forced <pos:block_pos>"));
     event.commands.push(Command::new(
         "rftoolsbuilder shape <shape:word> <dx:integer> <dy:integer> <dz:integer>",
     ));
@@ -1576,6 +1686,15 @@ pub(crate) fn on_run_mod_command(
                 return Flow::Cancel;
             }
             let line = status_at(host, pos);
+            feedback(host, &line);
+            Flow::Cancel
+        }
+        "forced" => {
+            let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos") else {
+                feedback(host, "usage: /rftoolsbuilder forced <x> <y> <z>");
+                return Flow::Cancel;
+            };
+            let line = forced_at(host, *pos);
             feedback(host, &line);
             Flow::Cancel
         }
@@ -1861,6 +1980,22 @@ fn status_at(host: &dyn Host, pos: [i32; 3]) -> String {
     })
 }
 
+/// `/rftoolsbuilder forced`: the chunks this Builder's ticket actually holds, as
+/// the game reports them (`LevelRef::mod_forced_chunks`) — the authoritative
+/// proof of the ticket, not just the saved copy in the block entity.
+fn forced_at(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
+    let owner = TicketOwner::Entity(runtime::ticket_owner(pos));
+    let chunks: Vec<[i32; 2]> = host
+        .level(host.dimension())
+        .and_then(|level| level.mod_forced_chunks(host, ticket_controller()))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(ticket_owner, _, _)| *ticket_owner == owner)
+        .map(|(_, chunk, _)| chunk)
+        .collect();
+    runtime::forced_line(pos, &chunks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2023,6 +2158,7 @@ mod tests {
                 at: [4, 66, -2],
                 reason: RefusalReason::NoMaterial,
             }),
+            forced_chunk: Some([3, -1]),
         };
         let mut nbt = Compound::new();
         state.write(&mut nbt);

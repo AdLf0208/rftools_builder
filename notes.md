@@ -27,15 +27,16 @@ One flat `.hmod` — `horizon-mod.toml` + `Cargo.toml` + `src/` + `assets/` +
 
 Status: **ported-partial** — slice 1 (the Builder's shaped mode with its shape
 cards), slice 2 (the carried recipes repaired to the 26.3 dialect and proven in
-game), slice 3 (the quarry card type, its void list and the replacement block) and
-slice 4 (`CARD_VOID`) are implemented, their 38 runtime tests and 10 glue tests
-(48 in all) are green, the SDK gate is green, and the package is **verified in a
-launcher-built game**: the modded leg passes every phase including the quarry's and
-the void card's, the unmodded control and the three selftest legs fail. The gap list
-below is the rest of the mod.
+game), slice 3 (the quarry card type, its void list and the replacement block),
+slice 4 (`CARD_VOID`) and slice 5 (quarry chunk loading) are implemented, their
+44 runtime tests and 10 glue tests (54 in all) are green, the SDK gate is green,
+and the package is **verified in a launcher-built game**: the modded leg passes
+every phase including the quarry's, the void card's and the force-load leg, the
+unmodded control and the four selftest legs fail. The gap list below is the rest
+of the mod.
 
-Package at **0.2.4**: **71,421 B**, SHA-256
-`de192fadf0fd60fef23fadeb5a8db84ef4e08ae989937702838003c92447c5f6`, built twice byte-identically against SDK **`0a875da9…`** + mixins
+Package at **0.2.5**: **75,185 B**, SHA-256
+`b647bc0a80cc03265d886e78cbec0617b7a63cb20f2a63f3da29bd5df31dcefc`, built twice byte-identically against SDK **`0a875da9…`** + mixins
 `e59da90…` (`check` exit 0, `fits` `made for` at the pin and `fits` at `0b14f8a`).
 The command → exact-output → log table for every number below is
 [`VALIDATION.md`](VALIDATION.md); the canonical logs are `sdk-test.log`,
@@ -882,6 +883,83 @@ need no opt-out because `--step e2e` is not forwarded.
 | game build | `bundle-game.sh` (local: no launcher on the remote) | `Compiling rftoolsbase (1 of 2)` / `Compiling rftoolsbuilder (2 of 2)`, `native-0a875da-2a85c3595f8a` | `../rftoolsbuilder-e2e/bundle-game-build.log` |
 | in-game | the five legs above | `PASS` + `EXIT:0`; control and three selftests `EXIT:1` | `../rftoolsbuilder-e2e/*.log` |
 
+## Slice 5 (0.2.5, 2026-11-24) — quarry chunk loading
+
+The gap line this slice answers, verbatim from *Gaps* 12: *"Chunk loading: upstream force-loads the chunk it is quarrying (`quarryChunkloads`, `ticketController.forceChunk`); the port reads `is_loaded` and waits instead … The pin can express the force-load branch (`Registrar::register_ticket_controller` + `chunk.set_mod_forced`)."* It fits `deep` exactly as slices 3–4 did: one more rule and a ticket in the Builder's existing tick, with no new block, item, renderer or recipe.
+
+### The ticket lifecycle, read from the jar (not inferred)
+
+`javap -c -p` over `BuilderTileEntity.class` (the 1,054,376-B jar), `chunkLoad(int,int)` and `chunkUnload()`:
+
+- `chunkLoad(x,z)`: `cx = x>>4, cz = z>>4`; if `LevelTools.isLoaded(level, (x,0,z))` return true; if `!BuilderConfiguration.quarryChunkloads.get()` (default **true**) return false (the port's old wait branch); if `new ChunkPos(cx,cz).equals(forcedChunk)` return true; else, when `forcedChunk != null && getOwnerUUID() != null`, release the old chunk with `forceChunk(level, uuid, oldx, oldz, false, false)`; set `forcedChunk = new ChunkPos(cx,cz)`; then force the new chunk with `forceChunk(level, uuid, x, z, <force>, false)`.
+- `chunkUnload()` (from `setRemoved`, the disabled-machine tick, and `restartScan`): if `forcedChunk != null && getOwnerUUID() != null`, release it (`forceChunk(..., false, false)`) and clear `forcedChunk`.
+- `handleSingleBlock` calls `chunkLoad(x,z)` at the scan position and suspends with `"Chunk not available!"` when it returns false.
+- **Upstream defect fixed.** The shipped jar's force call carries `iconst_0, iconst_0` at both sites (fresh extraction from the jar): its second `forceChunk` passes `false`, so it never actually adds the ticket. The port adopts the behaviour the config and the unload path mean — force with `true, false` (no natural spawning). The jar's owner is a UUID; the port derives a stable one from the Builder's position (`runtime::ticket_owner`) and uses the SDK's `TicketOwner::Entity`. The `Block` variant is avoided because the `fits` tool misreads it as an API-type change (the same false positive `compactmachines` records).
+
+### What the port carries
+
+- `register` calls `registrar.register_ticket_controller("quarry", true)` once and keeps the `Copy` handle in a `OnceLock` (the jar's `ModSetup.ticketController`).
+- `runtime::chunk_of`, `ticket_step`, `ticket_release`, `ticket_owner` and `forced_line` are pure and unit-tested. A wait at an unloaded cell forces that chunk and releases the one held before; holding the same chunk again is a no-op (`chunkLoad`'s `equals` early return).
+- The held chunk lives in the Builder's saved compound (`forcedChunk`), so it survives a relaunch. It is released when the pass ends, the card is removed/refused or changed, or the block is broken (the jar's `chunkUnload`, applied at pass completion so a second Builder cannot reuse the ticket).
+- `/rftoolsbuilder forced <pos>` reads `LevelRef::mod_forced_chunks` and prints the chunks this Builder's owner actually holds — the authoritative game-side proof, not the saved copy.
+
+### Red → green
+
+- Red (unit): the four new ticket tests written first → `error[E0425] … cannot find function ticket_step`, `error[E0433] … TicketPlan`, `error: could not compile rftoolsbuilder (lib test) due to 14 previous errors`, `TEST_EXIT:101` (`red-chunkload-compile.log`).
+- Red (0.2.4, verbatim): the same never-visited chunk rig on the 0.2.4 package stalls — `Builder at 20 102 2: Box (Solid) 3x3x3 offset 260 -152 260, 27 cells, quarry (Normal quarry), replacing with minecraft:dirt, 0 quarried, refused at 279 -49 261: the chunk is not loaded`, with `FAIL` and `EXIT:1` (`e2e-chunkload-024-red.log`).
+- Green: `cargo test --offline` → `running 54 tests` · `test result: ok. 54 passed; 0 failed` (`sdk-test.log`).
+
+### In game (0.2.5)
+
+`tools/e2e-chunkload.sh` on the launcher-built two-package game; a quarry card aimed 260 blocks east and south, 152 down, at a never-visited chunk:
+
+```
+first ticket during pass: Forced chunks at 19 102 7: [17,16]
+quarry status: Builder at 19 102 7: ... 27 quarried, scan complete
+chest after: 27; Forced chunks at 19 102 7: none
+corner read: {"block":"minecraft:dirt","loaded":true,"pos":[278,-51,266]}
+second rig first status: ... 0 quarried, refused at 278 -49 160: the chunk is not loaded
+second rig ticket: Forced chunks at 23 102 -3: [17,10]
+second rig status: ... 27 quarried, scan complete; Forced chunks at 23 102 -3: none
+```
+
+Every assertion can fail: `SELFTEST=chunkload` inverts the finish assertion and exits 1 (`FAIL: chunkload selftest: the pass completed in the unloaded chunk`); the unmodded control fails at `the first Builder is not at …`; 0.2.4 stalls with the unloaded-chunk refusal.
+
+| leg | result | log |
+|---|---|---|
+| package | **PASS** + `EXIT:0` | `../rftoolsbuilder-e2e/e2e-chunkload.log` |
+| 0.2.4 counterfactual | `0 quarried … refused at …: the chunk is not loaded` + `EXIT:1` | `e2e-chunkload-024-red.log` |
+| unmodded control | `FAIL: the first Builder is not at …` + `EXIT:1` | `e2e-chunkload-control.log` |
+| `SELFTEST=chunkload` | `FAIL: chunkload selftest: the pass completed in the unloaded chunk` + `EXIT:1` | `e2e-chunkload-selftest.log` |
+| log gate | `logs=14 ok=14 missing-exit=0 bad-exit=0` | — |
+
+**Coverage — the chunk-load family:**
+
+| family | status | proof |
+|---|---|---|
+| ticket-controller registration and handle | **tested** | unit: `check` reports `register_ticket_controller` among the 502 API items; in game: `/forced` answers `[17,16]` during the pass |
+| `chunkLoad`'s force and same-chunk no-op | **tested** | unit: `a_wait_at_an_unloaded_cell_forces_its_chunk_and_releases_the_old_one`, `waiting_again_in_the_same_chunk_does_not_repeat_the_ticket`; in game: 27 quarried in a never-visited chunk |
+| `chunkUnload`'s release | **tested** | unit: `finishing_the_pass_releases_the_held_chunk`; in game: `Forced chunks …: none` after the run and again after the second rig |
+| the owner UUID | **tested** | unit: `a_builders_ticket_owner_is_stable_and_position_specific`; two rigs hold separate tickets (`[17,16]` and `[17,10]`) |
+| the counterfactual (no ticket) | **tested** | 0.2.4 stalls at 0 quarried with `the chunk is not loaded`, `EXIT:1` |
+
+### Ladder (0.2.5)
+
+| Step | Command | Result | Log |
+|---|---|---|---|
+| red (unit) | `cargo test --offline`, four ticket tests first | `cannot find function ticket_step`, `TicketPlan`, `due to 14 previous errors`, `TEST_EXIT:101` | `red-chunkload-compile.log` |
+| unit tests | `cargo test --offline` | `54 passed; 0 failed` | `sdk-test.log` |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | `CLIPPY_EXIT:0` | `clippy.log` |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | `FMT_EXIT:0` | `fmt.log` |
+| SDK gate | `cargo horizon-mod check` | 502 API items, `Made for 0a875da.` | `check.log` |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | `CMP_IDENTICAL`, 75,185 B | `build.log`, `build2.log` |
+| registry check | `cargo horizon-mod check rftoolsbuilder.hmod` | `rftoolsbuilder 0.2.5 (native-mod, … for 26.3)`, `FILE_CHECK_EXIT:0` | `file-check-fits.log` |
+| fits, the pin | `… --build 0a875da…` | `0a875da  made for`, `FITS_PIN_EXIT:0` | `sdk-fits.log` |
+| fits, a different build | `… --build 0b14f8a…` | `0b14f8a  fits`, `FITS_OTHER_EXIT:0` | `sdk-fits-other.log` |
+| package gate | `python3 ports/tools/verify-sdk-package.py rftoolsbuilder` | **1/1** (31 entries, no packed `Cargo.lock`) | — |
+| game build | `bundle-game.sh` (local: `BUILD_LOCAL=1`, no launcher on the remote) | `Compiling rftoolsbase (1 of 2)` / `Compiling rftoolsbuilder (2 of 2)`, `native-0a875da-cd8a0de6d900` | `../rftoolsbuilder-e2e/bundle-game-build-025.log` |
+| in-game | the five legs above + the five existing legs re-run on 0.2.5 | `PASS` + `EXIT:0`; control and five selftests `EXIT:1` | `../rftoolsbuilder-e2e/*.log` |
+
 ## Gaps
 
 1. ~~**No in-game run.**~~ **Closed 2026-11-21**: `ports/tools/launcher-game.sh` and
@@ -912,12 +990,12 @@ need no opt-out because `--step e2e` is not forwarded.
     (`GenericEnergyStorage`, `BuilderConfiguration.builderRfPer*`).
 11. **`block_entity_set_placed_by` / `setPlacedBy`** — the pin has no fake
     player, so a placed block's own placement hook does not run (deviation 3).
-12. **Chunk loading**: upstream force-loads the chunk it is quarrying
-    (`quarryChunkloads`, `ticketController.forceChunk`); the port reads
-    `is_loaded` and waits instead (a recorded difference, no ticket). The pin can
-    express the force-load branch (`Registrar::register_ticket_controller` +
-    `chunk.set_mod_forced`), so this is the next slice's work, not a gap in the
-    API.
+12. ~~**Chunk loading**~~. **Carried 2026-11-24** (slice 5, 0.2.5): the Builder
+    registers its own ticket controller, force-loads the unloaded chunk its quarry
+    is working on (`chunkLoad` → `set_mod_forced`), releases the ticket when the pass
+    ends (`chunkUnload`), and `/rftoolsbuilder forced` reads the game's ticket table.
+    The jar's own force call passes `false` (a defect); the port forces with `true`
+    (see the slice-5 section).
 13. **The hilight mode, the progress HUD and the Builder's own renderer**
     (`updateHilight`, `IHudSupport`, `BuilderRenderer`).
 14. **The two recipes need `rftoolsbase:machine_frame`** (sibling port) and the
@@ -928,8 +1006,8 @@ need no opt-out because `--step e2e` is not forwarded.
 
 ## Verification
 
-Slice 1's run (0.2.0) is the table below; the current **0.2.4** numbers are in
-*Ladder (0.2.4)* in the slice-4 section above, and the file-level record is
+Slice 1's run (0.2.0) is the table below; the current **0.2.5** numbers are in
+*Ladder (0.2.5)* in the slice-5 section above, and the file-level record is
 [`VALIDATION.md`](VALIDATION.md).
 
 Every command ran through `ports/tools/build-slot.sh` (one lease per step); logs
@@ -973,11 +1051,26 @@ Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-de
 ## Publishing
 
 MIT, rank 0. The current artifact is `ports/rftoolsbuilder/rftoolsbuilder.hmod`
-(**71,421 B**, `de192fadf0fd60fef23fadeb5a8db84ef4e08ae989937702838003c92447c5f6`), version **0.2.4** — an **update** of the entry
+(**75,185 B**, `b647bc0a80cc03265d886e78cbec0617b7a63cb20f2a63f3da29bd5df31dcefc`), version **0.2.5** — an **update** of the entry
 this campaign owns (`Add rftoolsbuilder 0.2.0`, PR #1276, then 0.2.2 merged; 0.2.3
-staged on PR #1827), so the PR title is `Update rftoolsbuilder 0.2.4` and the body
-names the superseded PR. Publishing still needs the maintainer's approval
+and 0.2.4 staged on PR #1827), so the PR title is `Update rftoolsbuilder 0.2.5` and
+the body names the superseded PR. Publishing still needs the maintainer's approval
 (ARCHITECTURE.md §8).
+
+**Changelog (0.2.5) — supersedes 0.2.4:**
+
+- **Quarry chunk loading.** A quarry card registers its own ticket controller and
+  force-loads the unloaded chunk it is working on, releasing the ticket when the
+  pass ends so another Builder must force its own. `/rftoolsbuilder forced <pos>`
+  reads the game's ticket table. The jar's own `chunkLoad` passes `false` to
+  `forceChunk` (verified in bytecode), so the port adopts the behaviour the
+  config means: force with `true`.
+- 54 tests (was 48), clippy `-D warnings` clean, `check` 0, `fits` `made for` at
+  the pin and `fits` at `0b14f8a`; in game `PASS` + `EXIT:0` with the force-load
+  leg, the 0.2.4 counterfactual stalling at `0 quarried … the chunk is not loaded`,
+  the unmodded control `EXIT:1`, `SELFTEST=1` `EXIT:1`, `SELFTEST=quarry` `EXIT:1`,
+  `SELFTEST=void` `EXIT:1` and the new `SELFTEST=chunkload` `EXIT:1`;
+  `check-e2e-logs.py --strict` 14/14.
 
 **Changelog (0.2.4) — supersedes 0.2.3:**
 
